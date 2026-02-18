@@ -1224,6 +1224,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     visitedEpgs = set()
     groupCount = 0
     contractDnToESGMapping = {}
+    contractsReferences = set()
     logger.info(colored("------------------------------------", bold=True))
     logger.info(colored("RESULTS - Mode {}".format(mode), bold=True))
     logger.info(colored("------------------------------------", bold=True))
@@ -1414,32 +1415,43 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 logger.error(text)
                 sys.exit(1)
 
-        debugInfo = ""
-        # Populate JSON result only if there are EPG selectors or External Subnet selectors
-        esgJson = None
-        if epgSelectors or externalSubnetSelectors:
-            esgJson = {'name': name,
-                       'applicationProfile': appProfileName,
-                       'pcEnfPref': pcEnfPref,
-                       'prefGrMemb': prefGrMemb,
-                       'epgs':  sorted(list(epgSelectors)),
-                       'externalSubnets': [{'ip': ip, 'scope': scope} for ip, scope in externalSubnetSelectors],
-                       'prov': esgProv, 'cons': esgCons, 'consif': esgConsif, 'intraepg': esgIntraepg}
-            debugInfo = addEsgGroupDebugInfo(esgJson, vrfDn, debugInfo)
-
+        if epgSelectors or externalSubnetSelectors or \
+           ((leakInternalSubnetsFromProv or leakExternalPrefixes) and leakToConsumerVrfs) or \
+           ((leakInternalSubnetsFromCons or leakExternalPrefixes) and leakToProviderVrfs):
             vrfPresent = False
             for vrf in jsonResult['vrfs']:
                 if vrf['vrf'] == vrfDn:
                     vrfPresent = True
-                    vrf['esgs'].append(esgJson)
                     break
             if not vrfPresent:
                 # Create new VRF entry if not present
-                jsonResult['vrfs'].append({'vrf': vrfDn, 'esgs': [esgJson], 'leakInternalSubnets': [], 'leakExternalPrefixes': []})
+                jsonResult['vrfs'].append({'vrf': vrfDn, 'esgs': [], 'leakInternalSubnets': [], 'leakExternalPrefixes': []})
+
+        debugInfo = ""
+        # Populate JSON result only if there are EPG selectors or External Subnet selectors
+        esgJson = {'name': name,
+                    'applicationProfile': appProfileName,
+                    'pcEnfPref': pcEnfPref,
+                    'prefGrMemb': prefGrMemb,
+                    'epgs':  sorted(list(epgSelectors)),
+                    'externalSubnets': [{'ip': ip, 'scope': scope} for ip, scope in externalSubnetSelectors],
+                    'prov': esgProv, 'cons': esgCons, 'consif': esgConsif, 'intraepg': esgIntraepg}
+
+        # Populate contract references since they will be needed to generate contract clones
+        for key in ['prov', 'cons', 'consif', 'intraepg']:
+            for contractDn in esgJson[key]:
+                contractsReferences.add(contractDn)
+
+        if epgSelectors or externalSubnetSelectors:
+            debugInfo = addEsgGroupDebugInfo(esgJson, vrfDn, debugInfo)
+            for vrf in jsonResult['vrfs']:
+                if vrf['vrf'] == vrfDn:
+                    vrf['esgs'].append(esgJson)
+                    break
 
         # Handle leak subnets and prefixes
         # Populate leak subnets and prefixes at the VRF level
-        if (leakInternalSubnetsFromProv or leakExternalPrefixes) and (leakToConsumerVrfs):
+        if (leakInternalSubnetsFromProv or leakExternalPrefixes) and leakToConsumerVrfs:
             for vrf in jsonResult['vrfs']:
                 if vrf['vrf'] == vrfDn:
                     for ip, scope in leakInternalSubnetsFromProv:
@@ -1469,7 +1481,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                     break
             debugInfo = addLeakRouteDebugInfo(leakInternalSubnetsFromProv, leakExternalPrefixes, leakToConsumerVrfs, vrfDn, esgJson, debugInfo)
 
-        if (leakInternalSubnetsFromCons or leakExternalPrefixes) and (leakToProviderVrfs):
+        if (leakInternalSubnetsFromCons or leakExternalPrefixes) and leakToProviderVrfs:
             for vrf in jsonResult['vrfs']:
                 if vrf['vrf'] == vrfDn:
                     for ip, scope in leakInternalSubnetsFromCons:
@@ -1505,7 +1517,6 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     # Sort the leak subnets and prefixes and the contract clones for consistent output
     # Get the list of contracts references
     # Cleanup unused fields
-    contractsReferences = set()
     for vrf in jsonResult['vrfs']:
         vrf['leakInternalSubnets'] = sorted(vrf['leakInternalSubnets'], key=lambda x: x['ip'])
         vrf['leakExternalPrefixes'] = sorted(vrf['leakExternalPrefixes'], key=lambda x: x['ip'])
@@ -1514,9 +1525,6 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 esg['externalSubnets'] = sorted(esg['externalSubnets'], key=lambda x: x['ip'])
             else:
                 del esg['externalSubnets']
-            for key in ['prov', 'cons', 'consif', 'intraepg']:
-                for contractDn in esg[key]:
-                    contractsReferences.add(contractDn)
             if esg['pcEnfPref'] == "unenforced":
                 del esg['pcEnfPref']
             if esg['prefGrMemb'] == "exclude":
@@ -1592,7 +1600,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
             for prov in contractDnToESGMapping[contractDn]['prov']:
                 for consif in contractDnToESGMapping[contractDn]['consif']:
                     for contractIfClones in jsonResult['contractIfClones']:
-                        if contractIfClones['cloneFromDn'] == consif[0]:
+                        if contractIfClones['cloneFromDn'] == consif[0] and contractIfClones['consumerESG'] == consif[1]:
                             count += 1
                             jsonResult['contractClones'].append(
                                 {'cloneName': namePrefix + contractName + nameSuffix + '_' + str(count),
@@ -3619,7 +3627,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                             for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
                                 subnet = config.fvTenant(epgTenantName).l3extOut(name=epgL3OutName)\
                                                 .l3extInstP(name=epgName).l3extSubnet(ip=epgChildren.ip, scope=",".join(scope))
-                                subnet.xmlcomment = "Subnet not deleted since other flags are present. Remove security and route leak flags"
+                                subnet.xmlcomment = "Subnet not deleted since other flags are present. Reset only security and route leak flags"
                     else:
                         if 'shared-security' in scopeFlags or 'import-security' in scopeFlags:
                             allSecuritySubnetHandled = False

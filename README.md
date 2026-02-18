@@ -40,9 +40,8 @@ The migration is implemented in three parts
 1. Dryrun analyze the user config and group similar EPGs into ESGs. The analysis is outputted to a YAML file. Script usage is as follows -
 ```
 ./ESGMigrationAssistant dryrun --help
-usage: ESGMigrationAssistant dryrun [-h] [--json JSON | --xml XML | --targz TARGZ | --dbxml DBXML] [--disableNdMode] [--apic APIC]
-                                    [--username USERNAME] [--password PASSWORD] [--mode {optimized,one-to-one}]
-                                    [--tenantdns TENANTDNS] [--vrfdns VRFDNS] [--outYaml OUTYAML] [--prefix PREFIX] [--suffix SUFFIX]
+usage: ESGMigrationAssistant dryrun [-h] [--json JSON | --xml XML | --targz TARGZ | --dbxml DBXML] [--disableNdMode] 
+                                    [--apic APIC] [--username USERNAME] [--password PASSWORD] [--mode {optimized,one-to-one}] [--tenantdns TENANTDNS] [--vrfdns VRFDNS] [--outYaml OUTYAML] [--prefix PREFIX] [--suffix SUFFIX] [--showStats]
 
 options:
   -h, --help            show this help message and exit
@@ -57,18 +56,22 @@ options:
   --mode {optimized,one-to-one}
                         Select the mode of analysis: optimized (default) or one-to-one
   --tenantdns TENANTDNS
-                        Filter analysis to all the VRFs configured inside to the specified Tenants. Use comma separated Tenant DNs without spaces. Example: uni/tn-T1,uni/tn-T2
-  --vrfdns VRFDNS       Filter analysis to a subset of VRFs. Use comma separated VRF DNs without spaces. Example: uni/tn-T1/ctx-ctx1,uni/tn-T2/ctx-ctx2
+                        Filter the analysis to all VRFs within the specified Tenants. Provide a comma-separated list of Tenant DNs (no spaces). Example: uni/tn-T1,uni/tn-T2. May be combined with --vrfdns; both filters apply using AND logic.
+  --vrfdns VRFDNS       Filter the analysis to the specified VRFs. Provide a comma-separated list of VRF DNs (no 
+                        spaces). Example: uni/tn-T1/ctx-ctx1,uni/tn-T2/ctx-ctx2. May be combined with --tenantdns; both filters apply using AND logic.
   --outYaml OUTYAML     YAML file in which we report the execution plan
-  --prefix PREFIX       Prefix to add to cloned names (default: empty). Example: contract name is "web" and prefix is "e", cloned contract will be named "e_web"
-  --suffix SUFFIX       Suffix to add to cloned names (default: e). Example: contract name is "web" and suffix is "e", cloned contract will be named "web_e"
+  --prefix PREFIX       Prefix to add to cloned names (default: empty). Example: contract name is "web" and prefix is 
+                        "e", cloned contract will be named "e_web"
+  --suffix SUFFIX       Suffix to add to cloned names (default: e). Example: contract name is "web" and suffix is "e", 
+                        cloned contract will be named "web_e"
+  --showStats           Show statistics about the Fabric Config.
 ```
 
 2. Conversion uses the YAML file (it can be edited by the user) and generate the migration configuration
 ```
 ./ESGMigrationAssistant conversion --help
-usage: ESGMigrationAssistant conversion [-h] --inYaml INYAML --apic APIC [--username USERNAME] [--password PASSWORD] [--noConfig]
-                                        [--configStrategy {interactive,vrf}] [--outputFile OUTPUTFILE]
+usage: ESGMigrationAssistant conversion [-h] --inYaml INYAML --apic APIC [--username USERNAME] [--password PASSWORD] 
+                                        [--noConfig] [--configStrategy {interactive,vrf}] [--outputFile OUTPUTFILE]
 
 options:
   -h, --help            show this help message and exit
@@ -78,8 +81,7 @@ options:
   --password PASSWORD   Password for APIC
   --noConfig            Proposed configuration is not applied to APIC
   --configStrategy {interactive,vrf}
-                        Select the configuration strategy mode: in interactive mode (default) EPGs/External EPGs are migrated one by one, in vrf
-                        mode all EPGs/External EPGs assigned to a single VRF are migrated in a single transaction
+                        Select the configuration strategy mode: in interactive mode (default) EPGs/External EPGs are migrated one by one, in vrf mode all EPGs/External EPGs assigned to a single VRF are migrated in a single transaction
   --outputFile OUTPUTFILE
                         Output file for generated configuration (default: output.xml). Use .xml or .json extension to save in respective format
 ```
@@ -97,9 +99,7 @@ options:
   --password PASSWORD   Password for APIC
   --noConfig            Proposed configuration is not applied to APIC
   --configStrategy {interactive,vrf,global}
-                        Select the configuration strategy mode: in interactive mode (default) EPGs/External EPGs are cleaned up one by one, in vrf
-                        mode all EPGs/External EPGs assigned to a single VRF are cleaned up in a single transaction, in global mode (not
-                        recommended unless noConfig option is used) all EPGs/External EPGs are cleaned up in a single transaction
+                        Select the configuration strategy mode: in interactive mode (default) EPGs/External EPGs are cleaned up one by one, in vrf mode all EPGs/External EPGs assigned to a single VRF are cleaned up in a single transaction, in global mode (not recommended unless noConfig option is used) all EPGs/External EPGs are cleaned up in a single transaction
   --outputFile OUTPUTFILE
                         Output file for generated configuration (default: output.xml). Use .xml or .json extension to save in respective format.
 ```
