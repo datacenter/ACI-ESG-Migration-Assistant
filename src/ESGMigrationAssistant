@@ -1,0 +1,52 @@
+#!/bin/bash
+scriptdir=`dirname $0`
+rootdir=`readlink -f ${scriptdir}`
+
+##############################
+# Script buils information #
+##############################
+versionFile="${rootdir}/version.txt"
+if [[ ! -f "${versionFile}" ]]; then
+    echo "Missing build file: ${versionFile}"
+    exit 1
+fi
+
+build=$(grep -E '^Version:' "${versionFile}" | awk '{print $2}')
+
+##############################
+# Some convenience functions #
+##############################
+prematureExit () {
+    echo "${1}"
+    exit -1
+}
+
+head -4 ${versionFile}
+export PYTHONPATH=${rootdir}/deps
+runningFromAPIC=1
+acidiagCmd="acidiag"
+acidiagToInvoke=$(type -P ${acidiagCmd})
+if [[ ! -x ${acidiagToInvoke} ]]; then
+    runningFromAPIC=0
+    echo "Executing not from the controller"
+else
+    echo "Executing from APIC"
+fi
+
+if [[ ${runningFromAPIC} -eq 0 ]]; then
+    pythonVersion="3.12"
+    pythonCmd="python${pythonVersion}"
+    defaultPythonFallBack="/vol/apicbin/gmeo/utils/bin/${pythonCmd}"
+    pythonToInvoke=$(type -P ${pythonCmd})
+    if [[ ! -x ${pythonToInvoke} ]]; then
+        pythonToInvoke=${defaultPythonFallBack}
+    fi
+    if [[ ! -x ${pythonToInvoke} ]]; then
+        prematureExit "Cannot find ${pythonCmd} anywhere, and i need it"
+    fi
+    ${pythonToInvoke} ${rootdir}/ESGMigrationAssistant.py $@
+    exit $?
+fi
+cd ${rootdir}
+/opt/cisco/system-venv3/bin/python3 ${rootdir}/ESGMigrationAssistant.py --fromApic $@
+exit $?

@@ -1,0 +1,151 @@
+vrfs:
+- vrf: uni/tn-test/ctx-testctx0
+  esgs:
+  - name: ESG_test_AP_1
+    applicationProfile: AP
+    epgs:
+    - uni/tn-test/ap-AP/epg-epg1
+    - uni/tn-test/ap-AP/epg-epg2
+    prov:
+    - uni/tn-test/brc-testEPGcontract
+    - uni/tn-test/brc-testEPGcontract2
+    cons:
+    - uni/tn-test/brc-testEPGcontract
+  - name: ESG_test_AP_2
+    applicationProfile: AP
+    epgs:
+    - uni/tn-test/ap-AP/epg-epg3
+    - uni/tn-test/ap-AP/epg-epg4
+    cons:
+    - uni/tn-test/brc-testEPGcontract
+  leakInternalSubnets:
+  - ip: 1.1.0.0/24
+    scope: private
+    leakTo:
+    - uni/tn-insieme/ctx-insieme1
+    - uni/tn-test/ctx-testctx1
+    - uni/tn-user1/ctx-default
+  - ip: 1.2.0.0/24
+    scope: public
+    leakTo:
+    - uni/tn-insieme/ctx-insieme1
+    - uni/tn-test/ctx-testctx1
+    - uni/tn-user1/ctx-default
+  - ip: 4.4.4.10/32
+    scope: private
+    leakTo:
+    - uni/tn-insieme/ctx-insieme1
+    - uni/tn-test/ctx-testctx1
+    - uni/tn-user1/ctx-default
+  - ip: 4.4.4.20/32
+    scope: private
+    leakTo:
+    - uni/tn-insieme/ctx-insieme1
+    - uni/tn-test/ctx-testctx1
+    - uni/tn-user1/ctx-default
+  - ip: 4.4.4.4/32
+    scope: private
+    leakTo:
+    - uni/tn-insieme/ctx-insieme1
+    - uni/tn-test/ctx-testctx1
+    - uni/tn-user1/ctx-default
+  - ip: 4.4.4.5/32
+    scope: private
+    leakTo:
+    - uni/tn-insieme/ctx-insieme1
+    - uni/tn-test/ctx-testctx1
+    - uni/tn-user1/ctx-default
+  leakExternalPrefixes: []
+- vrf: uni/tn-test/ctx-testctx1
+  esgs:
+  - name: ESG_test_AP_3
+    applicationProfile: AP
+    pcEnfPref: enforced
+    epgs:
+    - uni/tn-test/ap-AP/epg-shared
+    cons:
+    - uni/tn-test/brc-testEPGcontract2
+    consif:
+    - uni/tn-test/cif-exportedinsiemeESGContract
+    intraepg:
+    - uni/tn-test/brc-testEPGcontract4
+  leakInternalSubnets: []
+  leakExternalPrefixes: []
+- vrf: uni/tn-insieme/ctx-insieme1
+  esgs:
+  - name: ESG_insieme_AP_4
+    applicationProfile: AP
+    epgs:
+    - uni/tn-insieme/ap-AP/epg-epg3
+    - uni/tn-insieme/ap-AP/epg-epg4
+    - uni/tn-insieme/ap-AP/epg-epg5
+    cons:
+    - uni/tn-insieme/brc-insiemeEPGcontract
+  - name: ESG_insieme_AP_5
+    applicationProfile: AP
+    epgs:
+    - uni/tn-insieme/ap-AP/epg-epg1
+    - uni/tn-insieme/ap-AP/epg-epg2
+    prov:
+    - uni/tn-insieme/brc-insiemeEPGcontract
+    consif:
+    - uni/tn-insieme/cif-testEPGContractExported
+  leakInternalSubnets: []
+  leakExternalPrefixes: []
+- vrf: uni/tn-insieme/ctx-insieme2
+  esgs:
+  - name: ESG_insieme_AP_6
+    applicationProfile: AP
+    epgs:
+    - uni/tn-insieme/ap-AP/epg-sharedConsumer
+    consif:
+    - uni/tn-insieme/cif-user1ESGcontractExported
+  leakInternalSubnets: []
+  leakExternalPrefixes: []
+- vrf: uni/tn-user1/ctx-default
+  esgs:
+  - name: ESG_user1_InstP_AP_7
+    applicationProfile: InstP_AP
+    epgs: []
+    externalSubnets:
+    - ip: 4.4.5.0/24
+      scope: private
+    - ip: 6.6.5.0/24
+      scope: private
+    prov:
+    - uni/tn-user1/brc-testESGcontract
+    cons:
+    - uni/tn-user1/brc-testESGcontract
+    consif:
+    - uni/tn-user1/cif-testEPGcontractExported
+  leakInternalSubnets: []
+  leakExternalPrefixes:
+  - ip: 4.4.5.0/24
+    leakTo:
+    - uni/tn-insieme/ctx-insieme2
+contractClones:
+- cloneName: insiemeEPGcontract_e
+  cloneFromDn: uni/tn-insieme/brc-insiemeEPGcontract
+- cloneName: insiemeESGcontract_e
+  cloneFromDn: uni/tn-insieme/brc-insiemeESGcontract
+- cloneName: testEPGcontract_e
+  cloneFromDn: uni/tn-test/brc-testEPGcontract
+- cloneName: testEPGcontract2_e
+  cloneFromDn: uni/tn-test/brc-testEPGcontract2
+- cloneName: testEPGcontract4_e
+  cloneFromDn: uni/tn-test/brc-testEPGcontract4
+- cloneName: testESGcontract_e
+  cloneFromDn: uni/tn-user1/brc-testESGcontract
+contractIfClones:
+- cloneName: testEPGContractExported_e
+  cloneFromDn: uni/tn-insieme/cif-testEPGContractExported
+  exportedFromDn: uni/tn-test/brc-testEPGcontract
+- cloneName: user1ESGcontractExported_e
+  cloneFromDn: uni/tn-insieme/cif-user1ESGcontractExported
+  exportedFromDn: uni/tn-user1/brc-testESGcontract
+- cloneName: exportedinsiemeESGContract_e
+  cloneFromDn: uni/tn-test/cif-exportedinsiemeESGContract
+  exportedFromDn: uni/tn-insieme/brc-insiemeESGcontract
+- cloneName: testEPGcontractExported_e
+  cloneFromDn: uni/tn-user1/cif-testEPGcontractExported
+  exportedFromDn: uni/tn-test/brc-testEPGcontract

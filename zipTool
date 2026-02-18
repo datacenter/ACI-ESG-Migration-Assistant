@@ -1,0 +1,131 @@
+#!/bin/bash
+
+##############################
+# Some convenience functions #
+##############################
+prematureExit () {
+    echo "${1}"
+    exit -1
+}
+
+function usage {
+    echo "Usage: $0
+                    [--debug]
+                    [--stage]
+
+          OPTIONS:
+          --debug: debug logs for the script
+          --stage: No full build, just stage locally in the build directory
+"
+}
+trap "echo 'Script early terminated'; exit 0" SIGINT SIGTERM SIGHUP
+#####################################################################
+# Perform all the operations relative to the location of the script #
+# invoked and not of the CWD, for reproducibility                   #
+#####################################################################
+scriptdir=`dirname $0`
+rootdir=`readlink -f ${scriptdir}`
+#####################################
+# Name of the tool we want to build #
+#####################################
+toolName=ESGMigrationAssistant
+toolNameStr="ESG Migration Assistant"
+toolVersion=$(cat "${rootdir}/VERSION")
+####################################
+# Python version we are targetting #
+####################################
+pythonVersion="3.12"
+pythonCmd="python${pythonVersion}"
+defaultPythonFallBack="/vol/apicbin/gmeo/utils/bin/${pythonCmd}"
+
+unknown_option=0
+debug=0
+stage=0
+shopt -s nocasematch
+while true ; do
+    case "$1" in
+        --debug) debug=1; shift ;;
+        --stage) stage=1; shift ;;
+        --help) usage; exit 0;;
+        -*) echo "Unknown option $1"; unknown_option=1; shift ;;
+        *) break;;
+    esac
+done
+
+if [ ${unknown_option} -eq 1 ]; then
+    echo "Met one or more unknown options"
+    usage
+    exit 1
+fi
+shopt -u nocasematch
+
+buildRoot=${rootdir}/build
+distRoot=${rootdir}/dist
+srcRoot=${rootdir}/src
+if [[ ${stage} -eq 0 ]]; then
+    rm -rf ${buildRoot}/*
+    rm -rf ${distRoot}/*
+fi
+depsDir="${buildRoot}/${toolName}-${toolVersion}/deps"
+mkdir -p ${buildRoot}
+mkdir -p ${distRoot}
+pythonToInvoke=$(type -P ${pythonCmd})
+if [[ ! -x ${pythonToInvoke} ]]; then
+    pythonToInvoke=${defaultPythonFallBack}
+fi
+if [[ ! -x ${pythonToInvoke} ]]; then
+    prematureExit "Cannot find ${pythonCmd} anywhere, and i need it"
+fi
+zipCmd="zip"
+zipToInvoke=$(type -P "${zipCmd}")
+if [[ ! -x ${zipToInvoke} ]]; then
+    prematureExit "Cannot find ${zipCmd} anywhere, and i need it"
+fi
+gitCmd="git"
+gitToInvoke=$(type -P "${gitCmd}")
+if [[ ! -x ${gitToInvoke} ]]; then
+    prematureExit "Cannot find ${gitCmd} anywhere, and i need it"
+fi
+mkdir -p "${buildRoot}/${toolName}-${toolVersion}"
+versionFile="${buildRoot}/${toolName}-${toolVersion}/version.txt"
+echo -e "${toolNameStr}\nVersion: ${toolVersion}" > "${versionFile}"
+echo -n "Git SHA: " >> "${versionFile}"
+gitSHA=`${gitToInvoke} rev-parse --verify HEAD`
+echo "${gitSHA}" >> "${versionFile}"
+if [[ $(${gitToInvoke} status --porcelain -uno | wc -l) -gt 0 ]]; then
+    echo "WITH LOCAL MODIFICATIONS, details in version.txt" >> "${versionFile}"
+    echo "Diffs Cached:" >> "${versionFile}"
+    ${gitToInvoke} diff --cached >> "${versionFile}"
+    echo "Diffs Not cached:" >> "${versionFile}"
+    ${gitToInvoke} diff >> "${versionFile}"
+fi
+echo ########################################
+echo  BUILDING
+head -2 "${versionFile}"
+echo ########################################
+
+if [[ ! -d "${depsDir}" ]]; then
+    mkdir -p ${depsDir}
+    echo ########################################
+    echo         COLLECTING DEPENDENCIES
+    echo ########################################
+    ${pythonToInvoke} -m pip install -r ${rootdir}/requirements.txt --target ${depsDir}
+fi
+cp ${srcRoot}/* ${buildRoot}/${toolName}-${toolVersion}/
+rm -f ${buildRoot}/${toolName}-${toolVersion}/*~ || true
+rm -f ${buildRoot}/${toolName}-${toolVersion}/.flake8 || true
+cp ${rootdir}/README.md ${buildRoot}/${toolName}-${toolVersion}/
+if [[ ${stage} -eq 1 ]]; then
+   echo "Stage completed, now you can test the tool from ${buildRoot}/${toolName}-${toolVersion}"
+   exit 0
+fi
+cd "${buildRoot}"
+toolZipFullName=${distRoot}/${toolName}-${toolVersion}.zip
+toolZipFullNameWSHA=${distRoot}/${toolName}-${toolVersion}-${gitSHA}.zip
+echo ########################################
+echo         ZIPPING THE TOOL
+echo ########################################
+${zipCmd} -r ${toolZipFullNameWSHA} ${toolName}-${toolVersion}
+ln -sf ${toolZipFullNameWSHA} ${toolZipFullName}
+echo "Your zipfile is available under: ${toolZipFullName} as well ${toolZipFullNameWSHA}"
+exit 0

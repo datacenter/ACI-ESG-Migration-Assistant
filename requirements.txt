@@ -1,0 +1,2 @@
+cisco-pyaci==1.1.2
+Pygments==2.19.2
