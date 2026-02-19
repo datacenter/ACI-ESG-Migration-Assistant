@@ -1832,7 +1832,7 @@ def cloneNodeSubtree(apic, sourceDn, targetDn, overrideProps):
 
     return target
 
-def validateESgToVrf(node, esgToVrfMap, perVrfPreExistingEsgMap):
+def validateESgToVrf(node, vrfConversionSet, esgToVrfMap, perVrfPreExistingEsgMap):
     """
     Helper function to validate ESG to VRF mapping.
     Validates that all VRFs mapped to ESGs exist and that the mapping
@@ -1869,7 +1869,8 @@ def validateESgToVrf(node, esgToVrfMap, perVrfPreExistingEsgMap):
                     logger.error("ESG {} (line {}) on YAML file is mapped to VRF {} but the same ESG on APIC is mapped to VRF {}".format(getNameFromDn(esgDn), esg_line, expectedVrfDn, mo.tDn))
                     return ReturnCode.VALIDATION_FAILED
             else:
-                perVrfPreExistingEsgMap.setdefault(mo.tDn, set()).add(esgDn)
+                if mo.tDn in vrfConversionSet:
+                    perVrfPreExistingEsgMap.setdefault(mo.tDn, set()).add(esgDn)
 
     return ReturnCode.SUCCESS
 
@@ -1880,6 +1881,7 @@ def validateAndCloneContracts(node, esgDataFromYaml, contractConversionDescripto
     contractConversionDescriptor. This is used for POSTs later during conversion.
     """
     logger = logging.getLogger(globalValues['logger'])
+    spinner.text = "Validating existing contracts"
 
     for contractData in esgDataFromYaml['contractClones']:
         cloneFromDn = contractData['cloneFromDn']
@@ -1904,7 +1906,7 @@ def validateAndCloneContracts(node, esgDataFromYaml, contractConversionDescripto
                                                   consumer=contractIfData.get('consumerESG', None))
     return ReturnCode.SUCCESS
 
-def validateInputYamlData(esgDataFromYaml, esgToVrfMap):
+def validateInputYamlData(esgDataFromYaml, vrfConversionSet, esgToVrfMap):
     """
     Helper function to validate Input Yaml file data prior to executing conversion.
     User has the option to modify Yaml file generated in dryrun phase.
@@ -2017,6 +2019,7 @@ def validateInputYamlData(esgDataFromYaml, esgToVrfMap):
             logger.error("VRF entry missing in YAML file: {} (line {})".format(vrfData, line))
             return False
         vrf = vrfData['vrf']
+        vrfConversionSet.add(vrf)
         if not isValidDn(vrf, ['uni', 'tn-', 'ctx-']):
             logger.error("VRF DN '{}' is not valid. The format should be 'uni/tn-<tenant_name>/ctx-<vrf_name>' (line {})".format(vrf, line))
             return False
@@ -2243,7 +2246,7 @@ def tcamCapacityCheck(node, showInfo=False):
                         nodeInfo[nodeId]['tcamCapacity']))
     return nodeInfo
 
-def capacityCheck(node, fabricDescriptor, esgDataFromYaml, noConfig):
+def capacityCheck(node, fabricDescriptor, vrfConversionSet, noConfig):
     """
     Helper function to check policy Tcam utilization.
     Conversion function can be run in one of two modes based on capacityCheck output
@@ -2260,6 +2263,8 @@ def capacityCheck(node, fabricDescriptor, esgDataFromYaml, noConfig):
     vrfWithWarnings = set()
     vrfWithCritical = set()
     nodeInfo = tcamCapacityCheck(node, showInfo=True)
+
+    spinner.text = "Calculate VRF to node deployment"
 
     for nodeId, data in nodeInfo.items():
         if data['tcamUsagePercent'] >= 80.0:
@@ -2298,11 +2303,11 @@ def capacityCheck(node, fabricDescriptor, esgDataFromYaml, noConfig):
     # Check that the VRF conversion list does not include VRFs in the vrfWithCritical list.
     numVrfConversionCritical = 0
     numVrfConversionWarning = 0
-    for vrfData in esgDataFromYaml['vrfs']:
-        if vrfData['vrf'] in vrfWithCritical:
-            logger.critical("Cannot migrate EPGs on VRF {} since the VRF is deployed on a node with with critical TCAM usage (>=80%)".format(vrfData['vrf']))
+    for vrfDn in vrfConversionSet:
+        if vrfDn in vrfWithCritical:
+            logger.critical("Cannot migrate EPGs on VRF {} since the VRF is deployed on a node with with critical TCAM usage (>=80%)".format(vrfDn))
             numVrfConversionCritical += 1
-        elif vrfData['vrf'] in vrfWithWarnings:
+        elif vrfDn in vrfWithWarnings:
             numVrfConversionWarning += 1
     if numVrfConversionCritical > 0:
         if noConfig:
@@ -3071,6 +3076,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         return rc
 
     def calculatePreExistingEsgContractRelations():
+        spinner.text = "Calculating contract relations for pre-existing ESGs in scope of conversion"
         for vrf in perVrfPreExistingEsgMap:
             for esgDn in perVrfPreExistingEsgMap[vrf]:
                 sourceSubtree = node.mit.FromDn(esgDn).GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
@@ -4214,9 +4220,10 @@ The generated configuration can be saved in XML or JSON format using the --outpu
         logger.error(f"Error reading YAML file {args.inYaml}: {e}")
         sys.exit(1)
 
+    vrfConversionSet = set()
     esgToVrfMap = {}
     perVrfPreExistingEsgMap = {}
-    if not validateInputYamlData(esgDataFromYaml, esgToVrfMap):
+    if not validateInputYamlData(esgDataFromYaml, vrfConversionSet, esgToVrfMap):
         sys.exit(1)
 
     # Conversion on APIC with script execution on APIC
@@ -4231,11 +4238,11 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     }
 
     # Check current policy tcam utilization to determine installation mode
-    capacityCheck(node, fabricDescriptor, esgDataFromYaml, args.noConfig)
+    capacityCheck(node, fabricDescriptor, vrfConversionSet, args.noConfig)
     tcamOptimizedMode = True if fabricDescriptor['numVrfConversionCritical'] or fabricDescriptor['numVrfConversionWarning'] else False
 
     # Validate existing ESG to VRF mapping
-    if validateESgToVrf(node, esgToVrfMap, perVrfPreExistingEsgMap) != ReturnCode.SUCCESS:
+    if validateESgToVrf(node, vrfConversionSet, esgToVrfMap, perVrfPreExistingEsgMap) != ReturnCode.SUCCESS:
         logger.error("ESG to VRF mapping validation failed, aborting conversion")
         sys.exit(1)
 
