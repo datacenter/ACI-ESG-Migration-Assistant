@@ -39,6 +39,7 @@ class RemoteCommandMo(pyaci.core.Mo):
 
 
 # Helper function to extract name from a DN (e.g., "tn-TenantA" -> "TenantA")
+@functools.cache
 def getNameFromDn(dn_string):
     parts = dn_string.split('/')
     for part in reversed(parts):
@@ -46,6 +47,7 @@ def getNameFromDn(dn_string):
             return part.split('-', 1)[1]
     return dn_string
 
+@functools.cache
 def getMgmtPFromDn(dn_string):
     parts = dn_string.split('/')
     for part in parts:
@@ -53,6 +55,7 @@ def getMgmtPFromDn(dn_string):
             return part[6:]
     return None
 
+@functools.cache
 def getTenantFromDn(dn):
     """
     Extracts the tenant name from a distinguished name (DN).
@@ -65,6 +68,7 @@ def getTenantFromDn(dn):
             return part[3:]  # Return the tenant name without 'tn-'
     return None  # Return None if no tenant found
 
+@functools.cache
 def getAppProfileFromDn(dn):
     """
     Extracts the application profile name from a distinguished name (DN).
@@ -77,6 +81,7 @@ def getAppProfileFromDn(dn):
             return part[3:]  # Return the tenant name without 'ap-'
     return None  # Return None if no AP found
 
+@functools.cache
 def getL3OutFromDn(dn):
     """
     Extracts the L3Out name from a distinguished name (DN).
@@ -89,6 +94,7 @@ def getL3OutFromDn(dn):
             return part[4:]  # Return the tenant name without 'out-'
     return None  # Return None if no L3Out found
 
+@functools.cache
 def getNodeIdFromDn(dn):
     """
     Extracts the nodeId name from a distinguished name (DN).
@@ -100,6 +106,7 @@ def getNodeIdFromDn(dn):
         return match.group(1)
     return None  # Return None if no nodeId found
 
+@functools.cache
 def getPodIdFromDn(dn):
     """
     Extracts the podId name from a distinguished name (DN).
@@ -170,6 +177,7 @@ def getRelationDescription():
         'vzRsAnyToCons': {'targetClass': 'vzBrCP', 'namingProperty': 'tnVzBrCPName', 'rtClass': 'vzRtAnyToCons', 'rnFormat': 'rtanyToCons-'},
         'vzRsAnyToConsIf' : {'targetClass': 'vzCPIf', 'namingProperty': 'tnVzCPIfName', 'rtClass': 'vzRtAnyToConsIf', 'rnFormat': 'rtanyToConsIf-'},
         'mgmtRsMgmtBD': {'targetClass': 'fvBD', 'namingProperty': 'tnFvBDName', 'rtClass': 'fvRtMgmtBD', 'rnFormat': 'rtmgmtMgmtBD-'},
+        'vzRsSubjFiltAtt': {'targetClass': 'vzFilter', 'namingProperty': 'tnVzFilterName', 'rtClass': 'vzRtSubjFiltAtt', 'rnFormat': 'rtsubjFiltAtt-'},
     }
     return relationDesc
 
@@ -185,6 +193,8 @@ def makeDn(classID, tenantName, name):
         return "uni/tn-{}/BD-{}".format(tenantName, name)
     elif classID == "fvCtx":
         return "uni/tn-{}/ctx-{}".format(tenantName, name)
+    elif classID == "vzFilter":
+        return "uni/tn-{}/flt-{}".format(tenantName, name)
     else:
         reportAFailure("Unsupported classID: {}".format(classID))
 
@@ -212,7 +222,6 @@ def tree():
 
 
 globalValues = tree()
-
 
 def catchException(fn):
     """
@@ -244,80 +253,6 @@ def setupPdb(args):
     Routine to setup the PDB as normally used in scripts
     """
     globalValues['usepdb'] = args.pdb
-
-
-# Copyright (C) 2018, Benjamin Drung <bdrung@posteo.de>
-#
-# Permission to use, copy, modify, and/or distribute this software for any
-# purpose with or without fee is hereby granted, provided that the above
-# copyright notice and this permission notice appear in all copies.
-#
-# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-# https://github.com/bdrung/snippets/blob/main/natural_sorted.py
-def natural_sorted(iterable, key=None, reverse=False):
-    """Return a new naturally sorted list from the items in *iterable*.
-
-    The returned list is in natural sort order. The string is ordered
-    lexicographically (using the Unicode code point number to order individual
-    characters), except that multi-digit numbers are ordered as a single
-    character.
-
-    Has two optional arguments which must be specified as keyword arguments.
-
-    *key* specifies a function of one argument that is used to extract a
-    comparison key from each list element: ``key=str.lower``.  The default value
-    is ``None`` (compare the elements directly).
-
-    *reverse* is a boolean value.  If set to ``True``, then the list elements are
-    sorted as if each comparison were reversed.
-
-    The :func:`natural_sorted` function is guaranteed to be stable. A sort is
-    stable if it guarantees not to change the relative order of elements that
-    compare equal --- this is helpful for sorting in multiple passes (for
-    example, sort by department, then by salary grade).
-    """
-    prog = re.compile(r"(\d+)")
-
-    def alphanum_key(element):
-        """Split given key in list of strings and digits"""
-        return [int(c) if c.isdigit() else c for c in prog.split(key(element)
-                                                                 if key else element)]
-
-    return sorted(iterable, key=alphanum_key, reverse=reverse)
-
-
-def findNextSignatureInBuffer(inputBuffer, startPtr, endPtr, signatures):
-    """
-    Routine takes in input an input buffer, a startPtr and endPtr and
-    a set of signatures expressed as packed structures and then start
-    to search on the inputBuffer, from startPtr to max endPtr for the
-    first signature that match in the lowest position. Routine useful
-    for magic pattern search.
-    """
-    # By default the start of the buffer is a match ...
-    matchList = []
-    for signature in signatures:
-        p = re.compile(signature, re.DOTALL+re.MULTILINE)
-        matches = p.finditer(inputBuffer, startPtr, endPtr)
-        firstMatch = next(matches)
-        if firstMatch and firstMatch.start():
-            matchList.append(firstMatch.start())
-    if not matchList:
-        return startPtr
-    return min(matchList)
-
-
-def prettyJsonTreeToString(jsonTree):
-    """
-    Pretty print a tree in Json format
-    """
-    return json.dumps(jsonTree, sort_keys=True, indent=4)
 
 
 @functools.cache
@@ -742,7 +677,7 @@ class Spinner:
                 break
             sys.stdout.write(f"\r{self._text} {char}")
             sys.stdout.flush()
-            time.sleep(0.1)
+            time.sleep(0.2)
 
     def stop(self):
         self._running = False

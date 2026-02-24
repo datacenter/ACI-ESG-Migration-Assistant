@@ -3,7 +3,6 @@ import argparse
 import sys
 import pdb
 import os
-import gc
 import pickle
 import xml.etree.ElementTree as ET
 import json
@@ -11,7 +10,7 @@ import yaml
 import re
 import ipaddress
 from collections import defaultdict
-from util import RemoteCommandMo, chomp, parseDnStr, tree, catchException, reportAFailure, Mo, Mit, ParserStub, globalValues,\
+from util import RemoteCommandMo, chomp, parseDnStr, catchException, reportAFailure, Mo, Mit, ParserStub, globalValues,\
      getNameFromDn, getTenantFromDn, getAppProfileFromDn, getL3OutFromDn, getPodIdFromDn, getNodeIdFromDn,\
      isValidDn, getNewContractDn, getNewContractIfDn, getMgmtPFromDn, getRelationDescription, makeDn, spinner
 import pyaci
@@ -85,19 +84,7 @@ def colored(text, color="green", bold=False, underline=False):
         attrs.append(colors.get(color, "32"))
     return text if not attrs else f"\033[{';'.join(attrs)}m{text}\033[m"
 
-def contractTypeToStr(contractType):
-    if contractType == 'prov':
-        return 'Provider'
-    elif contractType == 'cons':
-        return 'Consumer'
-    elif contractType == 'consif':
-        return 'Consumer Interface'
-    elif contractType == 'intraepg':
-        return 'Intra EPG Isolation'
-    else:
-        return 'Unknown'
-
-def epgDnToStr(epgDn):
+def epgDnToNameStr(epgDn):
     if isValidDn(epgDn, ['uni', 'tn-', 'ap-', 'epg-']):
         return 'Application EPG'
     elif isValidDn(epgDn, ['uni', 'tn-', 'out-', 'instP-']):
@@ -244,10 +231,10 @@ def addJsonChildToMit(subtree, mit, metaData, parentDn):
     except Exception as e:
         logger.debug("Exception {} occurred while processing addJsonChildToMit".format(e))
 
-def loadMitFromPickle(pickleFile):
+def loadMitFromPickle(pickleFile, inputFile):
     logger = logging.getLogger(globalValues['logger'])
     mit = None
-    if os.path.exists(pickleFile):
+    if os.path.exists(pickleFile) and os.path.getmtime(pickleFile) > os.path.getmtime(inputFile):
         try:
             with open(pickleFile, "rb") as pickleF:
                 spinner.text = "Loading MIT from pickle file"
@@ -272,8 +259,8 @@ def xmlToMit(inXmlFile, args):
     logger.info("Parsing XML file: {}".format(inXmlFile))
     spinner.text = "Parsing"
     pickleFile = "{}.pickle".format(inXmlFile)
+    mit = loadMitFromPickle(pickleFile, inXmlFile)
     aciMetaFilePath = args.acimeta
-    mit = loadMitFromPickle(pickleFile)
 
     if mit is None:
         mit = Mit(aciMetaFilePath)
@@ -313,7 +300,7 @@ def dbXmlToMit(inDbXmlFile, args):
     logger.info("Parsing XML DB file: {}".format(inDbXmlFile))
     spinner.text = "Parsing"
     pickleFile = "{}.pickle".format(inDbXmlFile)
-    mit = loadMitFromPickle(pickleFile)
+    mit = loadMitFromPickle(pickleFile, inDbXmlFile)
 
     if mit is None:
         mit = Mit(aciMetaFilePath=args.acimeta)
@@ -373,8 +360,8 @@ def jsonToMit(inDbJsonFile, args):
     logger.info("Parsing JSON DB file: {}".format(inDbJsonFile))
     spinner.text = "Parsing"
     pickleFile = "{}.pickle".format(inDbJsonFile)
+    mit = loadMitFromPickle(pickleFile, inDbJsonFile)
     aciMetaFilePath = args.acimeta
-    mit = loadMitFromPickle(pickleFile)
 
     if mit is None:
         mit = Mit(aciMetaFilePath)
@@ -493,7 +480,7 @@ def snapshotToMitLocal(inSnapJsonFileStr, path, args):
     inSnapJsonFileName = inSnapJsonFileStr.split('/')[-1]
     snapshotJson = inSnapJsonFileName.replace(".tar.gz", "_1.json")
     pickleFile = "./{}.pickle".format(snapshotJson)
-    mit = loadMitFromPickle(pickleFile)
+    mit = loadMitFromPickle(pickleFile, tarPath)
 
     if mit is None:
         spinner.text = "Waiting for snapshot file to be ready"
@@ -848,12 +835,12 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
             debugInfo += "\n      No contracts associated"
         return debugInfo
 
-    def addLeakRouteDebugInfo(leakInternal, leakExternal, leakToVrfs, vrfDn, esgJson, debugInfo):
+    def addLeakRouteDebugInfo(fromtype, leakInternal, leakExternal, leakToVrfs, vrfDn, esgJson, debugInfo):
         if leakToVrfs:
             if esgJson == None:
                 debugInfo += "Leak routes from VRF {}".format(vrfDn)
             if leakInternal:
-                debugInfo += "\n      Leak Internal Subnets:\n\t{}".format(
+                debugInfo += "\n      Leak Internal Subnets (as a {}):\n\t{}".format(fromtype,
                     ',\n\t'.join(f"{ip} ({scope})" for ip, scope in sorted(list(leakInternal))))
             if leakExternal:
                 debugInfo += "\n      Leak External Prefixes:\n\t{}".format(
@@ -921,6 +908,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     epgsWithUnsupportedFeatures = {}
     contractsWithUnsupportedFeatures = {}
     perVrfExternalSubnetSelectors = {}
+    contractToFilterDescriptor = {}
 
     noFiltersUsed = not filterVrfDns and not filterTenantDns
     filtersUsed = not noFiltersUsed
@@ -1004,6 +992,14 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                     if targetEpgDn:
                         targetConsEpgDns.add(targetEpgDn)
                         vrfsWithVzAnyContract.add(targetEpgDn.rsplit('/', 1)[0])
+                elif childMo.ClassName == "vzSubj":
+                    contractToFilterDescriptor.setdefault(childMo.Dn, {"contractDn": vzBrCPDn, "revFltPorts": childMo.getProp('revFltPorts'), "filterDns": set()})
+                    for subjChildMo in childMo.Children:
+                        if subjChildMo.ClassName == "vzRsSubjFiltAtt":
+                            filterDn = subjChildMo.getProp('tDn')
+                            if filterDn:
+                                contractToFilterDescriptor[childMo.Dn]["filterDns"].add(filterDn)
+
             brCPToProvider[vzBrCPDn] = targetProvEpgDns
             brCPToConsumer[vzBrCPDn] = targetConsEpgDns
             if vzBrCPMo.getProp('scope') == 'application-profile':
@@ -1174,6 +1170,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                     if "shared" in scopeFlags:
                         ip = ipaddress.ip_network(mo.getProp('ip'), strict=False)
                         epgDescriptor['leakInternalSubnetsFromProv'].append((str(ip), "public" if "public" in scopeFlags else "private"))
+                        epgDescriptor['leakInternalSubnetsFromCons'].append((str(ip), "public" if "public" in scopeFlags else "private"))
                 # Collect external prefixes to be leaked from Provider EPGs and external subnets for selectors
                 elif className == "l3extSubnet":
                     scopeFlags = [flag.strip() for flag in mo.getProp('scope').split(",")]
@@ -1187,7 +1184,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                             epgDescriptor['externalSubnets'].append((str(ip), "public" if "shared-security" in scopeFlags else "private"))
                 # Collect internal subnets to be leaked from the Consumer EPGs
                 if className == "fvRsBd" or className == "mgmtRsMgmtBD":
-                    epgDescriptor['leakInternalSubnetsFromCons'] = bdToSharedSubnet.get(mo.getProp('tDn'), [])
+                    epgDescriptor['leakInternalSubnetsFromCons'] += bdToSharedSubnet.get(mo.getProp('tDn'), [])
                 # Collect EPGs from which contracts are inherited
                 elif className == "fvRsSecInherited":
                     match = re.search(r"\[(.*?)\]", mo.Dn)
@@ -1479,7 +1476,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                                 le = 32 if ipaddress.ip_network(prefix).version == 4 else 128
                             vrf['leakExternalPrefixes'].append({'ip': prefix, 'le': le, 'ge': ge, 'leakTo': leakToConsumerVrfs})
                     break
-            debugInfo = addLeakRouteDebugInfo(leakInternalSubnetsFromProv, leakExternalPrefixes, leakToConsumerVrfs, vrfDn, esgJson, debugInfo)
+            debugInfo = addLeakRouteDebugInfo("Provider", leakInternalSubnetsFromProv, leakExternalPrefixes, leakToConsumerVrfs, vrfDn, esgJson, debugInfo)
 
         if (leakInternalSubnetsFromCons or leakExternalPrefixes) and leakToProviderVrfs:
             for vrf in jsonResult['vrfs']:
@@ -1509,7 +1506,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                                 le = 32 if ipaddress.ip_network(prefix).version == 4 else 128
                             vrf['leakExternalPrefixes'].append({'ip': prefix, 'le': le, 'ge': ge, 'leakTo': leakToProviderVrfs})
                     break
-            debugInfo = addLeakRouteDebugInfo(leakInternalSubnetsFromCons, leakExternalPrefixes, leakToProviderVrfs, vrfDn, esgJson, debugInfo)
+            debugInfo = addLeakRouteDebugInfo("Consumer", leakInternalSubnetsFromCons, leakExternalPrefixes, leakToProviderVrfs, vrfDn, esgJson, debugInfo)
 
         if debugInfo:
             logger.info(debugInfo)
@@ -1695,6 +1692,23 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
             logger.info("  Number of EPGs inheriting contracts: {}".format(vrfDescriptor['numSecInherited']))
             logger.info("  Number of External Subnets in External EPGs: {}".format(vrfDescriptor['numExternalSubnets']))
 
+        sameContractDescriptor = {}
+        for subjDn in contractToFilterDescriptor:
+            revFltPorts = contractToFilterDescriptor[subjDn]["revFltPorts"]
+            filterDns = contractToFilterDescriptor[subjDn]["filterDns"]
+            contractDn = contractToFilterDescriptor[subjDn]["contractDn"]
+            tenantDn = getTenantFromDn(subjDn)
+            sameContractDescriptor.setdefault(tenantDn, {}).setdefault((revFltPorts, frozenset(filterDns)), set()).add(contractDn)
+
+        for tenantDn, sameContractData in sameContractDescriptor.items():
+            text = "Contracts with the same filters in tenant {}:".format(colored(tenantDn))
+            for contractProps, contractDns in sameContractData.items():
+                if contractProps[1]:
+                    text+= "\n\tFor filters {}:".format(colored(", ".join(contractProps[1])))
+                    for contractDn in contractDns:
+                        text+= "\n\t\t{}".format(colored(contractDn))
+            logger.info(text)
+
     logger.info(colored("------------------------------------", bold=True))
     logger.info(colored("END of dryrun", bold=True))
     logger.info(colored("------------------------------------\n", bold=True))
@@ -1832,7 +1846,7 @@ def cloneNodeSubtree(apic, sourceDn, targetDn, overrideProps):
 
     return target
 
-def validateESgToVrf(node, vrfConversionSet, esgToVrfMap, perVrfPreExistingEsgMap):
+def validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap):
     """
     Helper function to validate ESG to VRF mapping.
     Validates that all VRFs mapped to ESGs exist and that the mapping
@@ -1869,7 +1883,7 @@ def validateESgToVrf(node, vrfConversionSet, esgToVrfMap, perVrfPreExistingEsgMa
                     logger.error("ESG {} (line {}) on YAML file is mapped to VRF {} but the same ESG on APIC is mapped to VRF {}".format(getNameFromDn(esgDn), esg_line, expectedVrfDn, mo.tDn))
                     return ReturnCode.VALIDATION_FAILED
             else:
-                if mo.tDn in vrfConversionSet:
+                if mo.tDn in vrfsInYaml["conversion"] or mo.tDn in vrfsInYaml["leakTo"]:
                     perVrfPreExistingEsgMap.setdefault(mo.tDn, set()).add(esgDn)
 
     return ReturnCode.SUCCESS
@@ -1906,7 +1920,7 @@ def validateAndCloneContracts(node, esgDataFromYaml, contractConversionDescripto
                                                   consumer=contractIfData.get('consumerESG', None))
     return ReturnCode.SUCCESS
 
-def validateInputYamlData(esgDataFromYaml, vrfConversionSet, esgToVrfMap):
+def validateInputYamlData(esgDataFromYaml, vrfsInYaml, esgToVrfMap):
     """
     Helper function to validate Input Yaml file data prior to executing conversion.
     User has the option to modify Yaml file generated in dryrun phase.
@@ -1917,7 +1931,6 @@ def validateInputYamlData(esgDataFromYaml, vrfConversionSet, esgToVrfMap):
     logger.info("Validate YAML input file data")
     validName = re.compile(r'[^a-zA-Z0-9_.:-]')
 
-    vrfSet = set()
     epgSet = set()
 
     if 'vrfs' not in esgDataFromYaml or not isinstance(esgDataFromYaml['vrfs'], list) or len(esgDataFromYaml['vrfs']) == 0:
@@ -2019,17 +2032,16 @@ def validateInputYamlData(esgDataFromYaml, vrfConversionSet, esgToVrfMap):
             logger.error("VRF entry missing in YAML file: {} (line {})".format(vrfData, line))
             return False
         vrf = vrfData['vrf']
-        vrfConversionSet.add(vrf)
         if not isValidDn(vrf, ['uni', 'tn-', 'ctx-']):
             logger.error("VRF DN '{}' is not valid. The format should be 'uni/tn-<tenant_name>/ctx-<vrf_name>' (line {})".format(vrf, line))
             return False
-        if vrf in vrfSet:
+        if vrf in vrfsInYaml["conversion"]:
             logger.error("Duplicate VRF entry found in YAML file: {} (line {})".format(vrf, line))
             return False
         else:
-            vrfSet.add(vrf)
-        if 'esgs' not in vrfData or not isinstance(vrfData['esgs'], list) or len(vrfData['esgs']) == 0:
-            logger.error("No ESGs defined for VRF {} in YAML file. (line {})".format(vrf, line))
+            vrfsInYaml["conversion"].add(vrf)
+        if 'esgs' not in vrfData or not isinstance(vrfData['esgs'], list):
+            logger.error("No esgs keyword or no esgs list defined for VRF {}. (line {})".format(vrf, line))
             return False
         for esg in vrfData['esgs']:
             esg_line = esg.get('__line__', line)
@@ -2144,6 +2156,11 @@ def validateInputYamlData(esgDataFromYaml, vrfConversionSet, esgToVrfMap):
                 if 'leakTo' not in leakInternalSubnet or not isinstance(leakInternalSubnet['leakTo'], list) or len(leakInternalSubnet['leakTo']) == 0:
                     logger.error("leakTo missing or invalid in leakInternalSubnets of VRF {}: {}. It should be a non-empty list of VRF DNs. (line {})".format(vrf, leakInternalSubnet, subnet_line))
                     return False
+                for leakToVrf in leakInternalSubnet['leakTo']:
+                    if not isValidDn(leakToVrf, ['uni', 'tn-', 'ctx-']):
+                        logger.error("leakTo VRF DN '{}' in leakInternalSubnets of VRF {} is not valid. The format should be 'uni/tn-<tenant_name>/ctx-<vrf_name>' (line {})".format(leakToVrf, vrf, subnet_line))
+                        return False
+                    vrfsInYaml["leakTo"].add(leakToVrf)
         if 'leakExternalPrefixes' in vrfData:
             for leakExternalPrefix in vrfData['leakExternalPrefixes']:
                 prefix_line = leakExternalPrefix.get('__line__', line)
@@ -2162,6 +2179,11 @@ def validateInputYamlData(esgDataFromYaml, vrfConversionSet, esgToVrfMap):
                 if 'leakTo' not in leakExternalPrefix or not isinstance(leakExternalPrefix['leakTo'], list) or len(leakExternalPrefix['leakTo']) == 0:
                     logger.error("leakTo missing or invalid in leakExternalPrefixes of VRF {}: {}. It should be a non-empty list of VRF DNs. (line {})".format(vrf, leakExternalPrefix, prefix_line))
                     return False
+                for leakToVrf in leakExternalPrefix['leakTo']:
+                    if not isValidDn(leakToVrf, ['uni', 'tn-', 'ctx-']):
+                        logger.error("leakTo VRF DN '{}' in leakExternalPrefixes of VRF {} is not valid. The format should be 'uni/tn-<tenant_name>/ctx-<vrf_name>' (line {})".format(leakToVrf, vrf, prefix_line))
+                        return False
+                    vrfsInYaml["leakTo"].add(leakToVrf)
                 if 'le' in leakExternalPrefix:
                     le = leakExternalPrefix['le']
                     if not isinstance(le, int):
@@ -2482,10 +2504,11 @@ def restoreCfgSnapshot(node, fileName):
         if not importConfigJobDelta:
             return None  # not ready yet
         return importConfigJobDelta.pop()
+
     result = waitForCondition(
         conditionFn = conditionFn,
         description = f"Rollback job creation",
-        timeout=60,
+        timeout=360,
         ih=InputHandler(),
         checkInterval = 1,
     )
@@ -2873,7 +2896,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                     clearCmd.POST()
             except Exception as e:
                 logger.error(f"Error clearing EP table: {e}")
-            spinner.stop()
             print()
 
         def extSubSelConditionFn():
@@ -3664,7 +3686,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
             continue
 
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
-            cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToStr(epgDn), colored(epgDn)), 'config': perEpgConfig})
+            cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToNameStr(epgDn), colored(epgDn)), 'config': perEpgConfig})
 
     # Cleanup contract relations to InB epgs which have tags to be deleted
     inbMos = node.methods.ResolveClass('mgmtInB').GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
@@ -3705,7 +3727,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                         break
 
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
-            cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToStr(inbMo.dn), colored(inbMo.dn)), 'config': perEpgConfig})
+            cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToNameStr(inbMo.dn), colored(inbMo.dn)), 'config': perEpgConfig})
 
     # Cleanup contract relations for pre-esisting fvESg which have tags to be deleted
     fvESgMos = findClassInstancesWithTag('fvESg', migrationAnnotateKey, migrationAnnotateVal, skipConfigIssues=True)
@@ -3751,7 +3773,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                         break
 
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
-            cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToStr(esgDn), colored(esgDn)), 'config': perEpgConfig})
+            cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToNameStr(esgDn), colored(esgDn)), 'config': perEpgConfig})
 
     # Cleanup contract relations to vzAny which have tags to be deleted
     vzAnyMos = findClassInstancesWithTag('vzAny', migrationAnnotateKey, migrationAnnotateVal, skipConfigIssues=True)
@@ -3791,7 +3813,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                         break
 
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
-            cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToStr(vzAnyMo.dn), colored(vzAnyMo.dn)), 'config': perEpgConfig})
+            cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToNameStr(vzAnyMo.dn), colored(vzAnyMo.dn)), 'config': perEpgConfig})
 
     if configStrategy == ConfigStrategy.VRF:
         for vrfDn, perVrfConfig in sorted(perVrfConfigToPost.items()):
@@ -4220,10 +4242,10 @@ The generated configuration can be saved in XML or JSON format using the --outpu
         logger.error(f"Error reading YAML file {args.inYaml}: {e}")
         sys.exit(1)
 
-    vrfConversionSet = set()
+    vrfsInYaml = {"conversion": set(), "leakTo": set()}
     esgToVrfMap = {}
     perVrfPreExistingEsgMap = {}
-    if not validateInputYamlData(esgDataFromYaml, vrfConversionSet, esgToVrfMap):
+    if not validateInputYamlData(esgDataFromYaml, vrfsInYaml, esgToVrfMap):
         sys.exit(1)
 
     # Conversion on APIC with script execution on APIC
@@ -4238,11 +4260,11 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     }
 
     # Check current policy tcam utilization to determine installation mode
-    capacityCheck(node, fabricDescriptor, vrfConversionSet, args.noConfig)
+    capacityCheck(node, fabricDescriptor, vrfsInYaml["conversion"], args.noConfig)
     tcamOptimizedMode = True if fabricDescriptor['numVrfConversionCritical'] or fabricDescriptor['numVrfConversionWarning'] else False
 
     # Validate existing ESG to VRF mapping
-    if validateESgToVrf(node, vrfConversionSet, esgToVrfMap, perVrfPreExistingEsgMap) != ReturnCode.SUCCESS:
+    if validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap) != ReturnCode.SUCCESS:
         logger.error("ESG to VRF mapping validation failed, aborting conversion")
         sys.exit(1)
 
