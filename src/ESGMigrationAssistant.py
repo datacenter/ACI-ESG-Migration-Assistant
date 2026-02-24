@@ -16,6 +16,7 @@ from util import RemoteCommandMo, chomp, parseDnStr, catchException, reportAFail
 import pyaci
 from pyaci import Node
 import time
+from datetime import datetime
 from enum import IntFlag, Enum
 from pygments import highlight
 from pygments.lexers import XmlLexer
@@ -2419,6 +2420,60 @@ def listSnapshotCfgJobs(node, snapshotName, type='configexp'):
 
     return jobSet
 
+def dryrunConfigSnapshot(node, snapshotName):
+    logger = logging.getLogger(globalValues['logger'])
+
+    rc = ReturnCode.SUCCESS
+    snapshotStr = None
+    dn = f"uni/backupst/snapshots-[uni/fabric/configexp-{snapshotName}]"
+    configSnapshotCont = node.mit.FromDn(dn).GET(**{'rsp-subtree': 'full'})
+
+    configSnapshotList = []
+    if configSnapshotCont and len(configSnapshotCont) > 0:
+        configSnapshotContMo = configSnapshotCont[0]
+        for configSnapshotMo in configSnapshotContMo.Children:
+            # Parse the timestamp into datetime
+            ts = datetime.fromisoformat(configSnapshotMo.createTime)
+            configSnapshotList.append({
+                "file": configSnapshotMo.fileName,
+                "time": ts
+            })
+    # Sort newest first
+    configSnapshotList.sort(key=lambda x: x["time"], reverse=True)
+
+    print()
+    logger.info("There {} {} existing snapshot{} for {}:".format(
+        "is" if len(configSnapshotList) == 1 else "are", len(configSnapshotList),
+        "" if len(configSnapshotList) == 1 else "s", snapshotName.replace("_", " ")))
+    logger.info("Please choose one of the existing snapshots or create a new one:")
+    logger.info(f"0. Create a new snapshot file")
+    for id, snap in enumerate(configSnapshotList, start=1):
+        logger.info(f"{id}. {snap['file']} — created at {snap['time']}")
+    print()
+    selection = None
+    rawChoice = None
+    while True:
+        try:
+            rawChoice = input("Make a selection by entering a number [0-{}] or Q-Quit: ".format(len(configSnapshotList)))
+            selection = int(rawChoice)
+            if 0 <= selection <= len(configSnapshotList):
+                break
+            else:
+                print("Invalid input.")
+        except ValueError:
+            if rawChoice and rawChoice.lower() == 'q':
+                sys.exit(0)
+            print("Invalid input.")
+
+    if selection == 0:
+        inputHandler.lastUserInput = 'a'
+        rc, snapshotStr = createCfgSnapshot(node, TOOL_NAME_STR + "_Dryrun_Config")
+        inputHandler.reset()
+    else:
+        snapshotStr = configSnapshotList[selection - 1]['file']
+
+    return rc, snapshotStr
+
 def createCfgSnapshot(node, snapshotName):
     """
     Creates snapshot of configuration.
@@ -2863,6 +2918,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         rc = ReturnCode.SUCCESS
 
         pcTag = 0
+        seg = 0
         epg = ""
         esgToNodeId = set()
         def epgSelConditionFn():
@@ -2939,30 +2995,28 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 epgs = esg.get('epgs', [])
                 externalSubnets = esg.get('externalSubnets', [])
 
-                if epgs and externalSubnets:
-                    logger.info("ESG {} has both EPGs and External Subnets defined. Will create separate ESG selectors for EPGs and External Subnets".format(colored(esgName)))
-                    for epg in epgs:
+                for epg in sorted(epgs):
+                    if isValidDn(epg, ['uni', 'tn-', 'out-', 'instP-']):
                         instPSelectorsConfigPatch.fvTenant(tenantName).fvAp(apName)\
                             .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg)\
                             .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
                         instPSelectorsDeletePatch.fvTenant(tenantName).fvAp(apName)\
                             .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg, status="deleted")
 
-                for epg in sorted(epgs):
-                    if not isValidDn(epg, ['uni', 'tn-', 'ap-', 'epg-']):
-                        continue
-                    perEpgSelectorConfig = node.mit.polUni()
-                    for config in [perEpgSelectorConfig, esgConfigs[vrfDn]['vrf']]:
-                        tagAnnConfig = config.fvTenant(tenantName).fvAp(apName)\
-                                    .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg)\
-                                    .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
-                        tagAnnConfig.xmlcomment = "tagAnnotation used to mark EPG selectors for ESG migration cleanup"
-                    logText = "On ESG {} assign EPG {} via EPG selector".format(colored(esgName), colored(epg))
-                    esgConfigs[vrfDn]['perEsgConfigs'].append({'config': perEpgSelectorConfig,
-                                      'logText': logText,
-                                      'pcTag': esgToPcTag.get(esgDn, 0),
-                                      'epg': epg,
-                                      'externalSubnets': []})
+                    elif isValidDn(epg, ['uni', 'tn-', 'ap-', 'epg-']):
+                        perEpgSelectorConfig = node.mit.polUni()
+                        for config in [perEpgSelectorConfig, esgConfigs[vrfDn]['vrf']]:
+                            tagAnnConfig = config.fvTenant(tenantName).fvAp(apName)\
+                                        .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg)\
+                                        .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                            tagAnnConfig.xmlcomment = "tagAnnotation used to mark EPG selectors for ESG migration cleanup"
+                        logText = "On ESG {} assign EPG {} via EPG selector".format(colored(esgName), colored(epg))
+                        esgConfigs[vrfDn]['perEsgConfigs'].append({'config': perEpgSelectorConfig,
+                                          'logText': logText,
+                                          'pcTag': esgToPcTag.get(esgDn, 0),
+                                          'seg': seg,
+                                          'epg': epg,
+                                          'externalSubnets': []})
 
                 if externalSubnets:
                     perExtSubSelectorConfig = node.mit.polUni()
@@ -2978,6 +3032,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                     esgConfigs[vrfDn]['perEsgConfigs'].append({'config': perExtSubSelectorConfig,
                                       'logText': logText,
                                       'pcTag': esgToPcTag.get(esgDn, 0),
+                                      'seg': seg,
                                       'epg': None,
                                       'externalSubnets': externalSubnets})
 
@@ -3001,6 +3056,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                     perEpgConfig = esgConfigs[vrfDn]['perEsgConfigs'].pop(0)
                     pcTag = perEpgConfig['pcTag']
                     epg = perEpgConfig['epg']
+                    seg = perEpgConfig['seg']
                     externalSubnets = perEpgConfig['externalSubnets']
                     logger.info(perEpgConfig['logText'])
                     selRc = logAndPost(perEpgConfig['config'], step = step)
@@ -3038,6 +3094,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                         for perEpgConfig in esgConfigs[vrfDn]['perEsgConfigs']:
                             pcTag = perEpgConfig['pcTag']
                             epg = perEpgConfig['epg']
+                            seg = perEpgConfig['seg']
                             externalSubnets = perEpgConfig['externalSubnets']
                             if epg:
                                 if pcTag:
@@ -4046,7 +4103,7 @@ it may {} between the grouped EPGs.
             logging.info(f"TARGZ File found: {args.targz}")
             mit = snapshotToMitLocal(args.targz, "", args)
     elif args.fromApic or args.apic:
-        rc, snapshotStr = createCfgSnapshot(node, TOOL_NAME_STR + "_Dryrun_Config")
+        rc, snapshotStr = dryrunConfigSnapshot(node, TOOL_NAME_STR + "_Dryrun_Config")
         if rc == ReturnCode.USERSKIPPED:
             logger.warning("A configuration snapshot file is required to proceed with dryrun. Either specify a file via the --json, --xml, --targz, or --dbxml option or allow the creation of a snapshot. Aborting dryrun")
             sys.exit(1)
