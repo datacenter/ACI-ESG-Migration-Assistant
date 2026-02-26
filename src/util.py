@@ -677,7 +677,7 @@ class Spinner:
                 break
             sys.stdout.write(f"\r{self._text} {char}")
             sys.stdout.flush()
-            time.sleep(0.2)
+            time.sleep(0.1)
 
     def stop(self):
         self._running = False
@@ -685,6 +685,9 @@ class Spinner:
             self._thread.join()
         sys.stdout.write("\r" + " " * (self._maxLen + 2) + "\r")
         sys.stdout.flush()
+
+    def isRunning(self):
+        return self._running
 
 spinner = Spinner()
 

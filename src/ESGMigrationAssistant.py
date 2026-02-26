@@ -31,7 +31,7 @@ ND_NAME_STR = "Nexus_Dashboard"
 # Length of the minimum ambigous subcommand
 MINCMDALIASLEN = 4
 XMLPOST_LEVEL_NUM = 25
-CONFIG_TIMEOUT = 30  # seconds
+CONFIG_TIMEOUT = 360  # 6 min
 # ANSI color codes
 RESET = "\033[0m"
 RED = "\033[91m"
@@ -171,9 +171,10 @@ def apicLoginGetNodeAndVersionCheck(args):
     # Version 6.1.4 and above supports external subnet selector and L3Out ESG
     minVersionRequired = "6.1(4)"
     if not checkApicVersionCompatibility(node, minVersionRequired):
-        logger.error("APIC version check: failed")
+        logger.error("APIC version check: FAIL")
         sys.exit(1)
-
+    else:
+        logger.info("APIC Version check: PASS")
     return node
 
 def addXmlChildtoMit(element, mit, metaData, parentDn):
@@ -559,12 +560,14 @@ def waitForCondition(conditionFn, description, timeout, ih, checkInterval=1, onS
             return result
 
         elapsed = counter * checkInterval
-        sys.stdout.write(f"\rWaiting for {description}... (elapsed {elapsed}s)  \r")
-        sys.stdout.flush()
+        if not spinner.isRunning():
+            sys.stdout.write(f"\rWaiting for {description}... (elapsed {elapsed}s)  \r")
+            sys.stdout.flush()
         time.sleep(checkInterval)
 
         counter += 1
         if counter >= timeout:
+            spinner.stop()
             sys.stdout.write("\r " + " " * 160 + "\r")
             sys.stdout.flush()
             userInput = ih.getInput("Configuration is taking more than {} seconds. Do you want to continue waiting (Y-Yes, N-No, Q-Quit): ".format(int(timeout)),
@@ -578,6 +581,24 @@ def waitForCondition(conditionFn, description, timeout, ih, checkInterval=1, onS
                 return None
             else:
                 counter = 0  # reset timer and keep waiting
+
+def callWithTokenRetry(node, func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        msg = str(e)
+        if ("Token was invalid" in msg or
+            "Token timeout" in msg or
+            'code="403"' in msg):
+
+            print("Session token expired, refreshing token and retrying...")
+
+            with open('/.aci/.sessions/.token') as f:
+                token = f.read().strip()
+            node.session.cookies["APIC-cookie"] = token
+            # retry once
+            return func(*args, **kwargs)
+        raise
 
 def logAndPostHandler(outputElem, node, outputFile = None, noConfig = True, step = None, allowYesToAll = False):
     logger = logging.getLogger(globalValues['logger'])
@@ -610,21 +631,6 @@ def logAndPostHandler(outputElem, node, outputFile = None, noConfig = True, step
         ET.indent(root)
         return ET.tostring(root, encoding="unicode")
 
-    def postWithTokenRetry(node, outputElem):
-        try:
-            return outputElem.POST(format='xml')
-        except Exception as e:
-            # check if it's a token timeout
-            if 'Token was invalid' in str(e) or 'Token timeout' in str(e) or 'code="403"' in str(e):
-                print("Session token expired, refreshing token and retrying POST...")
-
-                with open('/.aci/.sessions/.token') as tokenF:
-                    token = tokenF.read().strip()
-                node.session.cookies["APIC-cookie"] = token
-                # retry once
-                return outputElem.POST(format='xml')
-            raise
-
     rc = ReturnCode.SUCCESS
     logger.xmlpost(xmlWithComment(outputElem))
 
@@ -656,11 +662,11 @@ def logAndPostHandler(outputElem, node, outputFile = None, noConfig = True, step
             # If the POST is failing, do not write the XML into outputFile
             # Exception will occur on validation failure
             if not noConfig:
-                postWithTokenRetry(node, outputElem)
+                callWithTokenRetry(node, outputElem.POST, format='xml')
 
                 params = {'query-target-filter': 'eq(configpushTxCont.failedUpdate,"no")'}
                 def conditionFn():
-                    result = node.methods.ResolveClass('configpushTxCont').GET(**params)
+                    result = callWithTokenRetry(node, node.methods.ResolveClass('configpushTxCont').GET, **params)
                     return not bool(result)  # True when push complete (no results)
 
                 def onSuccess(_):
@@ -698,6 +704,7 @@ def logAndPostHandler(outputElem, node, outputFile = None, noConfig = True, step
         logger.info("POST skipped by user")
         rc |= ReturnCode.USERSKIPPED
 
+    spinner.stop()
     print()
     return rc
 
@@ -1518,6 +1525,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     for vrf in jsonResult['vrfs']:
         vrf['leakInternalSubnets'] = sorted(vrf['leakInternalSubnets'], key=lambda x: x['ip'])
         vrf['leakExternalPrefixes'] = sorted(vrf['leakExternalPrefixes'], key=lambda x: x['ip'])
+        vrf['esgs'] = sorted(vrf['esgs'], key=lambda x: x['name'])
         for esg in vrf['esgs']:
             if esg['externalSubnets']:
                 esg['externalSubnets'] = sorted(esg['externalSubnets'], key=lambda x: x['ip'])
@@ -1820,7 +1828,8 @@ def cloneNodeSubtree(apic, sourceDn, targetDn, overrideProps):
                     cleanupObj(nested)
 
     logger = logging.getLogger(globalValues['logger'])
-    sourceSubtree = apic.mit.FromDn(sourceDn).GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'config-only'})
+    params = {'rsp-subtree': 'full', 'rsp-prop-include': 'config-only'}
+    sourceSubtree = callWithTokenRetry(apic, apic.mit.FromDn(sourceDn).GET, **params)
 
     if sourceSubtree and len(sourceSubtree) > 0:
         source = sourceSubtree[0]
@@ -1863,7 +1872,7 @@ def validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap):
     spinner.text = "Validating existing ESG to VRF mapping"
 
     vrfConfigured = set()
-    result = node.methods.ResolveClass('fvCtx').GET()
+    result = callWithTokenRetry(node, node.methods.ResolveClass('fvCtx').GET, **{})
     for mo in result:
         vrfConfigured.add(mo.dn)
 
@@ -1874,7 +1883,7 @@ def validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap):
             return ReturnCode.VALIDATION_FAILED
 
     # Get all the fvRsScope. Each fvRsScope is created for each ESG and points to the VRF.
-    result = node.methods.ResolveClass('fvRsScope').GET()
+    result = callWithTokenRetry(node, node.methods.ResolveClass('fvRsScope').GET, **{})
     for mo in result:
         if mo.tDn:
             esgDn = mo.Parent.Dn
@@ -1929,7 +1938,7 @@ def validateInputYamlData(esgDataFromYaml, vrfsInYaml, esgToVrfMap):
     """
     logger = logging.getLogger(globalValues['logger'])
 
-    logger.info("Validate YAML input file data")
+    spinner.text = "Validating input YAML file data"
     validName = re.compile(r'[^a-zA-Z0-9_.:-]')
 
     epgSet = set()
@@ -2213,10 +2222,8 @@ def validateInputYamlData(esgDataFromYaml, vrfsInYaml, esgToVrfMap):
                         return False
     return True
 
-def tcamCapacityCheck(node, showInfo=False):
-    logger = logging.getLogger(globalValues['logger'])
-
-    spinner.text = "Checking TCAM capacity"
+def tcamGetNodeInfo(node):
+    spinner.text = "Collecting scale profile information for all nodes"
 
     nodeInfo = {}
     # Get Node Information
@@ -2236,6 +2243,12 @@ def tcamCapacityCheck(node, showInfo=False):
         nodeId = getNodeIdFromDn(mo.dn)
         if nodeId and nodeId in nodeInfo:
             nodeInfo[nodeId]['scaleProfile'] = mo.profType
+    return nodeInfo
+
+def tcamCapacityCheck(node, nodeInfo):
+    logger = logging.getLogger(globalValues['logger'])
+
+    spinner.text = "Checking TCAM capacity"
 
     # Get TCAM Utilization Summary
     # Formula: TCAM Utilization (%) = ( (polUsageCum − polUsageBase) / polUsageCapCum ) × 100
@@ -2249,25 +2262,23 @@ def tcamCapacityCheck(node, showInfo=False):
             nodeInfo[nodeId]['tcamCapacity'] = capacity
             nodeInfo[nodeId]['tcamUsagePercent'] = usage/capacity*100 if capacity > 0 else 0
 
-    if showInfo:
-        logger.info("TCAM Capacity Information - This is a {}, the actual capacity may vary:".format(colored("5 minutes average", None, underline=True)))
-        for nodeId in sorted(nodeInfo.keys(), key=int):  # sort nodeId numerically
-            if nodeInfo[nodeId]['role'] == 'leaf':
-                percentText = "{:.2f}%".format(nodeInfo[nodeId]['tcamUsagePercent'])
-                if nodeInfo[nodeId]['tcamUsagePercent'] >= 80.0:
-                    percentText = colored(percentText, 'red', bold=True)
-                elif nodeInfo[nodeId]['tcamUsagePercent'] >= 50.0:
-                    percentText = colored(percentText, 'magenta')
-                logger.info("Node {} pod {} - TCAM usage on {} ({}) with scale profile {} is {} ({}/{})".
-                    format(nodeId,
-                        nodeInfo[nodeId]['podId'],
-                        nodeInfo[nodeId]['name'],
-                        nodeInfo[nodeId]['model'],
-                        nodeInfo[nodeId]['scaleProfile'],
-                        percentText,
-                        nodeInfo[nodeId]['tcamUsage'],
-                        nodeInfo[nodeId]['tcamCapacity']))
-    return nodeInfo
+    logger.info("TCAM Capacity Information - This is a {}, the actual capacity may vary:".format(colored("5 minutes average", None, underline=True)))
+    for nodeId in sorted(nodeInfo.keys(), key=int):  # sort nodeId numerically
+        if nodeInfo[nodeId]['role'] == 'leaf':
+            percentText = "{:.2f}%".format(nodeInfo[nodeId]['tcamUsagePercent'])
+            if nodeInfo[nodeId]['tcamUsagePercent'] >= 80.0:
+                percentText = colored(percentText, 'red', bold=True)
+            elif nodeInfo[nodeId]['tcamUsagePercent'] >= 50.0:
+                percentText = colored(percentText, 'magenta')
+            logger.info("Node {} pod {} - TCAM usage on {} ({}) with scale profile {} is {} ({}/{})".
+                format(nodeId,
+                    nodeInfo[nodeId]['podId'],
+                    nodeInfo[nodeId]['name'],
+                    nodeInfo[nodeId]['model'],
+                    nodeInfo[nodeId]['scaleProfile'],
+                    percentText,
+                    nodeInfo[nodeId]['tcamUsage'],
+                    nodeInfo[nodeId]['tcamCapacity']))
 
 def capacityCheck(node, fabricDescriptor, vrfConversionSet, noConfig):
     """
@@ -2285,7 +2296,8 @@ def capacityCheck(node, fabricDescriptor, vrfConversionSet, noConfig):
     nodeCritical = []
     vrfWithWarnings = set()
     vrfWithCritical = set()
-    nodeInfo = tcamCapacityCheck(node, showInfo=True)
+    nodeInfo = tcamGetNodeInfo(node)
+    tcamCapacityCheck(node, nodeInfo)
 
     spinner.text = "Calculate VRF to node deployment"
 
@@ -2296,19 +2308,20 @@ def capacityCheck(node, fabricDescriptor, vrfConversionSet, noConfig):
             nodeWarnings.append(nodeId)
 
     # Get VRF to Node deployment
-    result = node.methods.ResolveClass('l3Ctx').GET()
-    for mo in result:
-        nodeId = getNodeIdFromDn(mo.dn)
-        if nodeId and nodeId in nodeInfo:
-            nodeInfo[nodeId]['vrfCount'] += 1
-            ctxPKey = mo.ctxPKey
-            if ctxPKey:
-                vrfDeployment.setdefault(ctxPKey, set())
-                vrfDeployment[ctxPKey].add(nodeId)
-                if nodeId in nodeWarnings:
-                    vrfWithWarnings.add(ctxPKey)
-                if nodeId in nodeCritical:
-                    vrfWithCritical.add(ctxPKey)
+    if nodeCritical or nodeWarnings:
+        result = callWithTokenRetry(node, node.methods.ResolveClass('l3Ctx').GET, **{})
+        for mo in result:
+            nodeId = getNodeIdFromDn(mo.dn)
+            if nodeId and nodeId in nodeInfo:
+                nodeInfo[nodeId]['vrfCount'] += 1
+                ctxPKey = mo.ctxPKey
+                if ctxPKey:
+                    vrfDeployment.setdefault(ctxPKey, set())
+                    vrfDeployment[ctxPKey].add(nodeId)
+                    if nodeId in nodeWarnings:
+                        vrfWithWarnings.add(ctxPKey)
+                    if nodeId in nodeCritical:
+                        vrfWithCritical.add(ctxPKey)
 
     if logger.isEnabledFor(logging.DEBUG):
         for ctxPKey in vrfDeployment:
@@ -2392,7 +2405,7 @@ def configpushPending(node):
     Returns number of pending config pushes.
     """
     params = {'query-target-filter': 'eq(configpushTxCont.failedUpdate,"no")'}
-    pendingJobs = node.methods.ResolveClass('configpushTxCont').GET(**params)
+    pendingJobs = callWithTokenRetry(node, node.methods.ResolveClass('configpushTxCont').GET, **params)
     if pendingJobs:
         return len(pendingJobs)
     return 0
@@ -2405,7 +2418,8 @@ def listSnapshotCfgJobs(node, snapshotName, type='configexp'):
     Pending config jobs are skipped and not returned.
     """
     dn = f"uni/backupst/jobs-[uni/fabric/{type}-{snapshotName}]"
-    jobCont = node.mit.FromDn(dn).GET(**{'rsp-subtree': 'full'})
+    params = {'rsp-subtree': 'full'}
+    jobCont = callWithTokenRetry(node, node.mit.FromDn(dn).GET, **params)
     jobSet = set()
 
     # Job not yet created
@@ -2426,7 +2440,8 @@ def dryrunConfigSnapshot(node, snapshotName):
     rc = ReturnCode.SUCCESS
     snapshotStr = None
     dn = f"uni/backupst/snapshots-[uni/fabric/configexp-{snapshotName}]"
-    configSnapshotCont = node.mit.FromDn(dn).GET(**{'rsp-subtree': 'full'})
+    params = {'rsp-subtree': 'full'}
+    configSnapshotCont = callWithTokenRetry(node, node.mit.FromDn(dn).GET, **params)
 
     configSnapshotList = []
     if configSnapshotCont and len(configSnapshotCont) > 0:
@@ -2510,7 +2525,7 @@ def createCfgSnapshot(node, snapshotName):
     result = waitForCondition(
         conditionFn = conditionFn,
         description = f"snapshot {snapshotName} creation (it can take a few minutes)",
-        timeout=360,
+        timeout=CONFIG_TIMEOUT,
         ih=InputHandler(),
         checkInterval = 1,
     )
@@ -2562,8 +2577,8 @@ def restoreCfgSnapshot(node, fileName):
 
     result = waitForCondition(
         conditionFn = conditionFn,
-        description = f"Rollback job creation",
-        timeout=360,
+        description = f"Rollback job",
+        timeout=CONFIG_TIMEOUT,
         ih=InputHandler(),
         checkInterval = 1,
     )
@@ -2633,11 +2648,10 @@ def checkApicVersionCompatibility(node, minV=None, maxV=None):
                 logger.warning(f"APIC {apic['id']} above max version {maxV}")
                 versionCheckPassed = False
 
-    if versionCheckPassed:
-        logger.info("Version check: passed")
     return versionCheckPassed
 
-def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outputFile, noConfig, tcamOptimizedMode, contractConversionDescriptor, configStrategy):
+def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outputFile, noConfig,
+                             tcamOptimizedMode, contractConversionDescriptor, configStrategy, fabricDescriptor):
     """
     Conversion function to convert input Yaml file to ACI config.
     If noConfig flag is True, generated config will be output to file and logged.
@@ -2683,7 +2697,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         perVrfConfig.fvTenant(vrfTennantName).fvCtx(vrfName)
         mode = "immediate"
 
-        for esg in esgList:
+        for esg in sorted(esgList, key=lambda x: x['name']):
             esgName = esg['name']
             appProfileName = esg['applicationProfile']
             esgPcEnfPref = esg.get('pcEnfPref', 'unenforced')
@@ -2718,8 +2732,8 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         vrfRc = logAndPost(perVrfConfig, step = steps['vrfs'])
         if applyConfig and vrfRc == ReturnCode.SUCCESS:
             vrfRc |= fillVrfDictionarySeg(vrfDn)
-            for esg in esgList:
-                vrfRc |= fillEsgDictionaryPcTag(esg, vrfDn)
+            vrfRc |= fillEsgDictionaryPcTag(esgList, vrfDn)
+
         return vrfRc
 
     def createEsgClonedContracts():
@@ -2755,8 +2769,8 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
             if ndContract:
                 newContractMo.tagAnnotation(key = ndContractAnnotateKey, value = oldContractDn)
 
+            logger.info("Cloning contract from {}".format(colored(oldContractDn)))
             if not inputHandler.isYesToAll() and configStrategy == ConfigStrategy.INTERACTIVE:
-                logger.info("Cloning contract subtree {}".format(colored(oldContractDn)))
                 rc |= logAndPost(newContractMo, step = steps['contractClones'])
             else:
                 appendContract(newContractMo)
@@ -2774,6 +2788,8 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         Create fvRsProv, fvRsCons and fvRsIntraEpg relationships from ESG to cloned contracts.
         """
         rc = ReturnCode.SUCCESS
+
+        spinner.text = "Analyze/Create ESG contract relations configuration"
 
         # Create contract relations for ESGs defined in YAML file
         esgConfigs = {}
@@ -2921,23 +2937,33 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         seg = 0
         epg = ""
         esgToNodeId = set()
+        epgToNodeToPcTag = {"executed": False}
         def epgSelConditionFn():
-            allEpgUpdated = True
-            params = {'query-target-filter': 'eq(vlanCktEp.epgDn,"{}")'.format(epg)}
-            concreteResult = node.methods.ResolveClass('vlanCktEp').GET(**params)
-            if not concreteResult:
-                logger.info("EPG {} updated with PC Tag {}, but EPG not present on any node".format(epg, pcTag))
-                return True  # Nothing to wait for — consider it "done"
+            nodesNotUpdated = set()
+            oldPcTag = 0
+            if not epgToNodeToPcTag["executed"]:
+                spinner.text = "Collecting EPG selector configuration on nodes (vlanCktEp objects)"
+                concreteResult = callWithTokenRetry(node, node.methods.ResolveClass('vlanCktEp').GET, **{})
+                epgToNodeToPcTag["executed"] = True
+                for vlanCktEpMo in concreteResult:
+                    epgToNodeToPcTag.setdefault(vlanCktEpMo.epgDn, {})[vlanCktEpMo.dn] = int(vlanCktEpMo.pcTag)
 
-            for mo in concreteResult:
-                if int(mo.pcTag) != pcTag:
-                    logger.info("EPG {} on node {} has not been yet updated with PC Tag {} (current {})"\
-                                .format(mo.epgDn, getNodeIdFromDn(mo.dn), pcTag, mo.pcTag))
-                    allEpgUpdated = False
-                else:
-                    logger.info("EPG {} on node {} has been updated with PC Tag {}".format(mo.epgDn, getNodeIdFromDn(mo.dn), pcTag))
-                    esgToNodeId.add(getNodeIdFromDn(mo.dn))
-            return allEpgUpdated
+            if epg in epgToNodeToPcTag:
+                for vlanCktEpDn in epgToNodeToPcTag[epg]:
+                    nodeId = getNodeIdFromDn(vlanCktEpDn)
+                    esgToNodeId.add(nodeId)
+                    if epgToNodeToPcTag[epg][vlanCktEpDn] != pcTag:
+                        nodesNotUpdated.add(nodeId)
+                        oldPcTag = epgToNodeToPcTag[epg][vlanCktEpDn]
+                        epgToNodeToPcTag["executed"] = False  # Re-run the check on next iteration to get updated pcTag values
+            if not nodesNotUpdated:
+                logger.info("{} {} was updated on all nodes with PC Tag {}".format(epgDnToNameStr(epg), epg, pcTag))
+            else:
+                logger.info("Waiting for {} {} on node{} {} to update with PC Tag {} (current {})"
+                    .format(epgDnToNameStr(epg), epg, "s" if len(nodesNotUpdated) > 1 else "",
+                            ",".join(sorted(nodesNotUpdated)), pcTag, oldPcTag))
+                spinner.text = "Collecting EPG selector configuration on nodes (vlanCktEp objects)"
+            return len(nodesNotUpdated) == 0
 
         def epgSelOnSuccess(_):
             # Need to clear the EP table for the EPGs assigned to this ESG
@@ -2952,29 +2978,32 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                     clearCmd.POST()
             except Exception as e:
                 logger.error(f"Error clearing EP table: {e}")
+            spinner.stop()
             print()
 
         def extSubSelConditionFn():
-            allEpgUpdated = True
+            nodesNotUpdated = set()
             if ipaddress.ip_network(subnet['ip'], strict=False) == ipaddress.ip_network('0.0.0.0/0') or \
                 ipaddress.ip_network(subnet['ip'], strict=False) == ipaddress.ip_network('::/0'):
                 # These prefixes are split and create two actrlPfxEntry objects, but not on all conditions
                 # Keep the logic simple and skip waiting for these prefixes
                 return True
             params = {'query-target-filter': 'eq(actrlPfxEntry.addr,"{}")'.format(subnet['ip'])}
-            concreteResult = node.methods.ResolveClass('actrlPfxEntry').GET(**params)
+            concreteResult = callWithTokenRetry(node, node.methods.ResolveClass('actrlPfxEntry').GET, **params)
             for mo in concreteResult:
                 if str(seg) not in mo.dn:
                     continue
                 if int(mo.pcTag) != pcTag:
-                    logger.info("actrlPfxEntry {} on node {} has not been yet updated with PC Tag {} (current {})"\
+                    logger.info("Waiting for actrlPfxEntry {} on node {} to update with PC Tag {} (current {})"\
                                 .format(mo.dn, getNodeIdFromDn(mo.dn), pcTag, mo.pcTag))
-                    allEpgUpdated = False
-                else:
-                    logger.info("actrlPfxEntry {} on node {} has been updated with PC Tag {}".format(mo.dn, getNodeIdFromDn(mo.dn), pcTag))
-            return allEpgUpdated
+                    nodesNotUpdated.add(getNodeIdFromDn(mo.dn))
+
+            if not nodesNotUpdated:
+                logger.info("actrlPfxEntry {} was updated on all nodes with PC Tag {}".format(subnet['ip'], pcTag))
+            return len(nodesNotUpdated) == 0
 
         def extSubSelOnSuccess(_):
+            spinner.stop()
             print()
 
         esgConfigs = {}
@@ -3037,8 +3066,11 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                                       'externalSubnets': externalSubnets})
 
         # Post Temporary External EPG selector config to minimize the traffic impact
-        if len(list(instPSelectorsConfigPatch.Children)):
-            instPSelectorsConfigPatch.POST()
+        if applyConfig and len(list(instPSelectorsConfigPatch.Children)):
+            try:
+                callWithTokenRetry(node, instPSelectorsConfigPatch.POST, format='xml')
+            except Exception as e:
+                pass
 
         # Post EPG and External Subnet selector configs for ESGs. If in interactive mode,
         # post per ESG config one by one.
@@ -3047,7 +3079,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         for vrfDn in esgConfigs:
             if len(esgConfigs[vrfDn]['perEsgConfigs']) > 0:
                 step['total'] += len(esgConfigs[vrfDn]['perEsgConfigs']) if configStrategy == ConfigStrategy.INTERACTIVE else 1
-
 
         for vrfDn in esgConfigs:
             somethingToConfigure = len(esgConfigs[vrfDn]['perEsgConfigs']) > 0
@@ -3120,8 +3151,12 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                     rc |= allRc
 
         # Post Delete of External EPG selector config used to minimize the traffic impact
-        if len(list(instPSelectorsDeletePatch.Children)):
-            instPSelectorsDeletePatch.POST()
+        if applyConfig and len(list(instPSelectorsDeletePatch.Children)):
+            try:
+                callWithTokenRetry(node, instPSelectorsDeletePatch.POST, format='xml')
+            except Exception as e:
+                pass
+
         return rc
 
     def createEsgPbrCtx():
@@ -3130,8 +3165,10 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         Clone PBR Logical Device Context Subtree and set contract attributes to newly cloned ESG contract
         """
         rc = ReturnCode.SUCCESS
+
+        spinner.text = "Analyze/Create PBR Logical Device Context for ESGs in scope of conversion"
         configToPost = []
-        vnsLDevCtxMos = node.methods.ResolveClass('vnsLDevCtx').GET()
+        vnsLDevCtxMos = callWithTokenRetry(node, node.methods.ResolveClass('vnsLDevCtx').GET, **{})
         for vnsLDevCtxMo in vnsLDevCtxMos:
             pbrCtxTenant = getTenantFromDn(vnsLDevCtxMo.dn)
             pbrCtrctName = vnsLDevCtxMo.ctrctNameOrLbl
@@ -3158,11 +3195,14 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         spinner.text = "Calculating contract relations for pre-existing ESGs in scope of conversion"
         for vrf in perVrfPreExistingEsgMap:
             for esgDn in perVrfPreExistingEsgMap[vrf]:
-                sourceSubtree = node.mit.FromDn(esgDn).GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
+                params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all'}
+                sourceSubtree = callWithTokenRetry(node, node.mit.FromDn(esgDn).GET, **params)
                 if not sourceSubtree or len(sourceSubtree) == 0:
                     logger.error(f"Unable to retreive information related to pre-existing ESG {esgDn}")
                     continue
                 esgMo = sourceSubtree[0]
+                if esgMo.pcTag != "any":
+                    esgToPcTag[esgDn] = int(esgMo.pcTag)
                 if esgMo.shutdown == "yes":
                     logger.info(f"Pre-existing ESG {esgDn} is shutdown, skipping contract relation extraction")
                     continue
@@ -3185,9 +3225,8 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                             if contractConversionDescriptor.getByConsumerIf(contractIfDn, esgMo.dn):
                                 preExistingEsgNewContractMap.setdefault(vrf, {})\
                                     .setdefault(esgDn, {}).setdefault('consif', set()).add(contractIfDn)
-
                     elif child.ClassName == "fvEPgSelector":
-                        epgSourceSubtree = node.mit.FromDn(child.matchEpgDn).GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
+                        epgSourceSubtree = callWithTokenRetry(node, node.mit.FromDn(child.matchEpgDn).GET, **{'rsp-subtree': 'children', 'rsp-prop-include': 'all'})
                         if not epgSourceSubtree or len(epgSourceSubtree) == 0:
                             logger.error(f"Unable to retreive information related to pre-existing ESG {esgDn}")
                             continue
@@ -3218,9 +3257,11 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         Connect mgmtInB objects with cloned ESG contracts
         """
         rc = ReturnCode.SUCCESS
-        inbMos = node.methods.ResolveClass('mgmtInB').GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
-        configToPost = []
 
+        spinner.text = "Analyze/Create Inband contract relations configuration"
+        configToPost = []
+        params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all'}
+        inbMos = callWithTokenRetry(node, node.methods.ResolveClass('mgmtInB').GET, **params)
         for inbMo in inbMos:
             tenantName = getTenantFromDn(inbMo.dn)
             mgmtPName = getMgmtPFromDn(inbMo.dn)
@@ -3231,7 +3272,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 if child.ClassName == "fvRsProv":
                     contractDn = child.tDn
                     if not contractDn:
-                        logger.debug("Relation {} {} under {} missing target Dn, skipping contract relation".format(child.ClassName, child.dn, inbMo.dn))
                         continue
                     for newContract in contractConversionDescriptor.getByProvider(contractDn, inbMo.dn):
                         perContractConfig.fvTenant(tenantName).mgmtMgmtP(mgmtPName)\
@@ -3245,7 +3285,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 elif child.ClassName == "fvRsCons":
                     contractDn = child.tDn
                     if not contractDn:
-                        logger.debug("Relation {} {} under {} missing target Dn, skipping contract relation".format(child.ClassName, child.dn, inbMo.dn))
                         continue
                     for newContract in contractConversionDescriptor.getByConsumer(contractDn, inbMo.dn):
                         perContractConfig.fvTenant(tenantName).mgmtMgmtP(mgmtPName)\
@@ -3259,7 +3298,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 elif child.ClassName == "fvRsConsIf":
                     contractIfDn = child.tDn
                     if not contractIfDn:
-                        logger.debug("Relation {} {} under {} missing target Dn, skipping contract relation".format(child.ClassName, child.dn, inbMo.dn))
                         continue
                     for newContract in contractConversionDescriptor.getByConsumerIf(contractIfDn, inbMo.dn):
                         contractIfName = getNameFromDn(newContract['newContractDn'])
@@ -3290,9 +3328,11 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         Connect vzAny objects with cloned ESG contracts
         """
         rc = ReturnCode.SUCCESS
-        vzAnyMos = node.methods.ResolveClass('vzAny').GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
-        configToPost = []
 
+        spinner.text = "Analyze/Create vzAny contract relations configuration"
+        configToPost = []
+        params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all'}
+        vzAnyMos = callWithTokenRetry(node, node.methods.ResolveClass('vzAny').GET, **params)
         for vzAnyMo in vzAnyMos:
             tenantName = getTenantFromDn(vzAnyMo.dn)
             vrfName = getNameFromDn(vzAnyMo.dn)
@@ -3302,7 +3342,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 if child.ClassName == "vzRsAnyToProv":
                     contractDn = child.tDn
                     if not contractDn:
-                        logger.info("Relation {} {} under {} missing target Dn, skipping contract relation".format(child.ClassName, child.dn, vzAnyMo.dn))
                         continue
                     for newContract in contractConversionDescriptor.getByProvider(contractDn, vzAnyMo.dn):
                         perContractConfig.fvTenant(tenantName).fvCtx(vrfName)\
@@ -3316,7 +3355,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 elif child.ClassName == "vzRsAnyToCons":
                     contractDn = child.tDn
                     if not contractDn:
-                        logger.info("Relation {} {} under {} missing target Dn, skipping contract relation".format(child.ClassName, child.dn, vzAnyMo.dn))
                         continue
                     for newContract in contractConversionDescriptor.getByConsumer(contractDn, vzAnyMo.dn):
                         perContractConfig.fvTenant(tenantName).fvCtx(vrfName)\
@@ -3330,7 +3368,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 elif child.ClassName == "vzRsAnyToConsIf":
                     contractIfDn = child.tDn
                     if not contractIfDn:
-                        logger.info("Relation {} {} under {} missing target Dn, skipping contract relation".format(child.ClassName, child.dn, vzAnyMo.dn))
                         continue
                     for newContract in contractConversionDescriptor.getByConsumerIf(contractIfDn, vzAnyMo.dn):
                         contractIfName = getNameFromDn(newContract['newContractDn'])
@@ -3365,14 +3402,15 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         Fills the vrfToSeg dictionary.
         """
         def conditionFn():
-            results = node.mit.FromDn(vrf).GET()
+            results = callWithTokenRetry(node, node.mit.FromDn(vrf).GET, **{})
             if results and len(results) > 0 and results[0].seg != "any":
                 return int(results[0].seg)
             return None
 
         def onSuccess(segId):
             vrfToSeg[vrf] = segId
-            logger.debug("VRF {} has been assigned Segment ID {}".format(colored(vrf), colored(segId)))
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("VRF {} has been assigned Segment ID {}".format(colored(vrf), colored(segId)))
 
         def onFailure():
             vrfToSeg[vrf] = 0
@@ -3387,38 +3425,51 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
         return ReturnCode.SUCCESS if segId else ReturnCode.CONFIG_TIMEOUT
 
-    def fillEsgDictionaryPcTag(esgData, vrf):
+    def fillEsgDictionaryPcTag(esgList, vrf):
         """
         Nested helper function
         Fills the esgToPcTag dictionary with the PC Tag assigned to the ESG after creation.
         """
-        tenantName = getTenantFromDn(esgData['epgs'][0]) if esgData['epgs'] else getTenantFromDn(vrf)
-        appProfileName = esgData['applicationProfile']
-        esgName = esgData['name']
-        esgDn = f"uni/tn-{tenantName}/ap-{appProfileName}/esg-{esgName}"
+
+        esgDns = set()
+        for esgData in esgList:
+            tenantName = getTenantFromDn(esgData['epgs'][0]) if esgData['epgs'] else getTenantFromDn(vrf)
+            appProfileName = esgData['applicationProfile']
+            esgName = esgData['name']
+            esgDn = f"uni/tn-{tenantName}/ap-{appProfileName}/esg-{esgName}"
+            if esgDn not in esgToPcTag:
+                esgToPcTag[esgDn] = 0
+                esgDns.add(esgDn)
+
+        description = "{} ESG{} on VRF {} to be assigned a PC Tag".format(
+            len(esgList), "" if len(esgList) == 1 else "s", vrf)
+        spinner.text = f"Waiting for {description}"
 
         def conditionFn():
-            results = node.mit.FromDn(esgDn).GET()
-            if results and len(results) > 0 and results[0].pcTag != "any":
-                return int(results[0].pcTag)
+            if len(esgDns) > 0:
+                for esgMo in callWithTokenRetry(node, node.methods.ResolveClass('fvESg').GET, **{}):
+                    if esgMo.pcTag != "any":
+                        esgToPcTag[esgMo.dn] = int(esgMo.pcTag)
+                        esgDns.discard(esgMo.dn)
+            if len(esgDns) == 0:
+                return True
             return None
 
-        def onSuccess(pcTag):
-            esgToPcTag[esgDn] = pcTag
-            logger.debug("ESG {} has been assigned PC Tag {}".format(colored(esgName), colored(pcTag)))
+        def onSuccess(_):
+            logger.info("All ESGs on VRF {} have been assigned PC Tags".format(colored(vrf)))
 
         def onFailure():
-            esgToPcTag[esgDn] = 0
+            logger.error("Failed to assign PC Tags to all ESGs on VRF {}".format(colored(vrf)))
 
-        pcTag = waitForCondition(
+        result = waitForCondition(
             conditionFn = conditionFn,
-            description = "ESG {} on tenant {} to be assigned a PC Tag".format(colored(esgName), colored(tenantName)),
+            description = description,
             timeout = CONFIG_TIMEOUT,
             ih = InputHandler(),
             onSuccess = onSuccess,
             onFailure = onFailure)
 
-        return ReturnCode.SUCCESS if pcTag else ReturnCode.CONFIG_TIMEOUT
+        return ReturnCode.SUCCESS if result else ReturnCode.CONFIG_TIMEOUT
 
     #
     # Phase 1
@@ -3475,7 +3526,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         inputHandler.reset()
 
     if applyConfig:
-        tcamCapacityCheck(node, showInfo=True)
+        tcamCapacityCheck(node, fabricDescriptor['nodeInfo'])
 
     #
     # Phase 3
@@ -3505,7 +3556,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         inputHandler.reset()
 
     if applyConfig:
-        tcamCapacityCheck(node, showInfo=True)
+        tcamCapacityCheck(node, fabricDescriptor['nodeInfo'])
 
     logger.info(colored("----------------------------", bold=True))
     logger.info(colored("END of EPG to ESG conversion", bold=True))
@@ -3537,7 +3588,8 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         Returns list of matching MO objects
         """
         matchingMos = []
-        mos = node.methods.ResolveClass(className).GET(**{'rsp-subtree': 'children', 'rsp-subtree-class': 'tagAnnotation'})
+        params = {'rsp-subtree': 'children', 'rsp-subtree-class': 'tagAnnotation', 'rsp-subtree-include': 'required'}
+        mos = callWithTokenRetry(node, node.methods.ResolveClass(className).GET, **params)
 
         for mo in mos:
             if skipConfigIssues and getattr(mo, "configIssues", None):
@@ -3567,20 +3619,21 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
     perVrfConfigToPost = {}
     cleanupSequence = []
 
-    spinner.text = "Analyze configuration"
-
+    spinner.text = "Collecting EPG Selectors"
     epgSelectors = findClassInstancesWithTag('fvEPgSelector', migrationAnnotateKey, migrationAnnotateVal, skipConfigIssues=True)
     for epgSelector in epgSelectors:
         cleanupEPgs[epgSelector.matchEpgDn] = {"epgSelector": epgSelector.dn, "vrfDn": epgSelector.matchScope}
 
+    spinner.text = "Collecting External Subnet Selectors"
     externalSubnets = findClassInstancesWithTag('fvExternalSubnetSelector', migrationAnnotateKey, migrationAnnotateVal, skipConfigIssues=True)
     for externalSubnet in externalSubnets:
         cleanupExternalSubnets.setdefault(externalSubnet.matchScope, set())
         cleanupExternalSubnets[externalSubnet.matchScope].add((ipaddress.ip_network(externalSubnet.ip, strict=False), externalSubnet.dn))
 
     if cleanupExternalSubnets:
+        spinner.text = "Collecting External EPGs and subnets matching External Subnet selectors marked for cleanup"
         # Get all the existing External EPGs and their subnets if there are any external subnet selectors to clean up
-        for extEpgMo in node.methods.ResolveClass('fvRtdEpPInfoHolder').GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'}):
+        for extEpgMo in node.methods.ResolveClass('fvRtdEpPInfoHolder').GET(**{'rsp-subtree': 'children', 'rsp-prop-include': 'all'}):
             vrfDn = extEpgMo.ctxDefDn.removeprefix("uni/ctx-[").removesuffix("]")
             if vrfDn not in cleanupExternalSubnets: continue
             instPDn = extEpgMo.epgPKey
@@ -3598,12 +3651,14 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                                 cleanupEPgs[instPDn] = {"epgSelector": None, "vrfDn": vrfDn}
 
     lenCleanupEPgs = len(cleanupEPgs)
-    logger.debug("Found {} potential EPG{} to clean up".format(lenCleanupEPgs, '' if lenCleanupEPgs == 1 else 's'))
+    logger.info("Found {} potential EPG{} to clean up".format(lenCleanupEPgs, '' if lenCleanupEPgs == 1 else 's'))
 
-    spinner.text = "Analyze configuration"
-
+    epgNum = 0
     for epgDn in sorted(cleanupEPgs):
         epgData = cleanupEPgs[epgDn]
+        epgNum += 1
+        spinner.text = "Analyzing configuration for {} {}/{}: {}" \
+            .format(epgDnToNameStr(epgDn), epgNum, lenCleanupEPgs, epgDn)
         vrfDn = epgData["vrfDn"]
         if not vrfDn:
             logger.error(f"Unable to determine VRF for EPG with Dn {epgDn}. Skipping cleanup of this EPG.")
@@ -3616,7 +3671,9 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         epgL3OutName = getL3OutFromDn(epgDn)
         epgName = getNameFromDn(epgDn)
 
-        sourceSubtree = node.mit.FromDn(epgDn).GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
+        params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all',
+                  'rsp-subtree-class': 'fvRsBd,fvRsProv,fvRsCons,fvRsIntraEpg,fvRsConsIf,fvRsSecInherited,fvSubnet,fvEpNlb,fvEpAnycast,fvEpReachability,l3extSubnet'}
+        sourceSubtree = callWithTokenRetry(node, node.mit.FromDn(epgDn).GET, **params)
         if not sourceSubtree or len(sourceSubtree) == 0:
             logger.error(f"There is an Selector configured for EPG {epgDn}, but the EPG does not exist. Skipping cleanup of this EPG.")
             continue
@@ -3636,7 +3693,8 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
             for epgChildren in epgMo.Children:
                 if epgChildren.ClassName == 'fvRsBd':
                     bdDn = epgChildren.tDn
-                    logger.debug("EPG {} is associated to BD {}".format(epgDn, bdDn))
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("EPG {} is associated to BD {}".format(epgDn, bdDn))
                     break
 
             for epgChildren in epgMo.Children:
@@ -3745,8 +3803,10 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
             cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToNameStr(epgDn), colored(epgDn)), 'config': perEpgConfig})
 
+    spinner.text = "Analyzing configuration for Inband EPG"
     # Cleanup contract relations to InB epgs which have tags to be deleted
-    inbMos = node.methods.ResolveClass('mgmtInB').GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
+    params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all'}
+    inbMos = callWithTokenRetry(node, node.methods.ResolveClass('mgmtInB').GET, **params)
     for inbMo in inbMos:
         eppDn = 'uni/epp/inb-[{}]'.format(inbMo.dn)
         eppRequest = node.mit.FromDn(eppDn).GET()
@@ -3786,11 +3846,13 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
             cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToNameStr(inbMo.dn), colored(inbMo.dn)), 'config': perEpgConfig})
 
+    spinner.text = "Analyzing pre-migration ESGs"
     # Cleanup contract relations for pre-esisting fvESg which have tags to be deleted
     fvESgMos = findClassInstancesWithTag('fvESg', migrationAnnotateKey, migrationAnnotateVal, skipConfigIssues=True)
     for fvESgMo in fvESgMos:
         esgDn = fvESgMo.dn
-        fvESgSubtree = node.mit.FromDn(esgDn).GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
+        params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all'}
+        fvESgSubtree = callWithTokenRetry(node, node.mit.FromDn(esgDn).GET, **params)
         if not fvESgSubtree or len(fvESgSubtree) == 0:
             continue
         for child in fvESgSubtree[0].Children:
@@ -3832,6 +3894,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
             cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToNameStr(esgDn), colored(esgDn)), 'config': perEpgConfig})
 
+    spinner.text = "Analyzing vzAny instances"
     # Cleanup contract relations to vzAny which have tags to be deleted
     vzAnyMos = findClassInstancesWithTag('vzAny', migrationAnnotateKey, migrationAnnotateVal, skipConfigIssues=True)
     for vzAnyMo in vzAnyMos:
@@ -3843,7 +3906,9 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         # Cleanup vzAny Tag Annotation
         for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
             config.fvTenant(tenantName).fvCtx(vrfName).vzAny().tagAnnotation(key=migrationAnnotateKey, status="deleted")
-        vzAnySubtree = node.mit.FromDn(vzAnyMo.dn).GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
+
+        params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all'}
+        vzAnySubtree = callWithTokenRetry(node, node.mit.FromDn(vzAnyMo.dn).GET, **params)
         if not vzAnySubtree or len(vzAnySubtree) == 0:
             continue
         for child in vzAnySubtree[0].Children:
@@ -3898,7 +3963,6 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
 
     inputHandler.reset()
 
-    spinner.text = "Collecting contracts for cleanup"
     # Cleanup contracts from previous phase which no longer have any contract associations
     cleanupSequence = []
     globalConfigToPost = node.mit.polUni()
@@ -3906,23 +3970,31 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
     cleanupContracts.pop('', None)
     deletedProvContracts = defaultdict(set) # EPG Tenant to Deleted Provider Contract Set
     contractRelClasses = ['vzRtCons', 'vzRtProv', 'vzRtIntraEpg', 'vzRtConsIf', 'vzRtAnyToCons', 'vzRtAnyToProv', 'vzRtAnyToConsIf']
+    contractNum = 0
+    contractNumTot = len(cleanupContracts)
     for contract, deletedRtRelations in sorted(cleanupContracts.items()):
+        contractNum += 1
+        spinner.text = "Analyzing configuration for contract {}/{}: {}".format(contractNum, contractNumTot, contract)
+
         perContractConfig = node.mit.polUni()
         contractCleanup = True
         tenant = getTenantFromDn(contract)
         perTenantConfigToPost.setdefault(tenant, node.mit.polUni())
         contractName = getNameFromDn(contract)
-        sourceSubtree = node.mit.FromDn(contract).GET(**{'rsp-subtree': 'full', 'rsp-prop-include': 'all'})
 
+        params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all',
+               'rsp-subtree-class': 'vzRtCons,vzRtProv,vzRtIntraEpg,vzRtConsIf,vzRtAnyToCons,vzRtAnyToProv,vzRtAnyToConsIf'}
+        sourceSubtree = callWithTokenRetry(node, node.mit.FromDn(contract).GET, **params)
         if not sourceSubtree or len(sourceSubtree) == 0:
             logger.error(f"Error in retrieving and cleaning up contract {contract} on {tenant}. Skipping cleanup of this contract.")
-            spinner.text = "Collecting contracts for cleanup"
+            spinner.text = "Analyzing configuration for contract {}/{}: {}".format(contractNum, contractNumTot, contract)
             continue
         for childMo in sourceSubtree[0].Children:
             if childMo.ClassName in contractRelClasses:
                 if childMo.Dn not in deletedRtRelations:
                     contractCleanup = False
-                    logger.debug("Contract {} still has RT relations. Skipping cleanup of this contract.".format(contract))
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("Contract {} still has RT relations. Skipping cleanup of this contract.".format(contract))
                     break
 
         if contractCleanup:
@@ -3968,7 +4040,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
     cleanupSequence = []
     globalConfigToPost = node.mit.polUni()
     perTenantConfigToPost = {}
-    vnsLDevCtxMos = node.methods.ResolveClass('vnsLDevCtx').GET()
+    vnsLDevCtxMos = callWithTokenRetry(node, node.methods.ResolveClass('vnsLDevCtx').GET, **{})
     for vnsLDevCtxMo in vnsLDevCtxMos:
         perContractConfig = node.mit.polUni()
         vnsTenant = getTenantFromDn(vnsLDevCtxMo.Dn)
@@ -4289,14 +4361,14 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     contractConversionDescriptor = ContractConversionDescriptor()
 
     try:
-        logger.info(f"Loading YAML file {args.inYaml}")
+        spinner.text = f"Loading YAML file {args.inYaml}"
         with open(args.inYaml, 'r') as yaml_in:
             esgDataFromYaml = yaml.load(yaml_in, Loader=LineNumberLoader)
         if not esgDataFromYaml:
             raise ValueError("YAML file is empty")
-        logger.info(f"Successfully read YAML file {args.inYaml}")
+        logger.info(f"Successfully loaded YAML file {args.inYaml}")
     except Exception as e:
-        logger.error(f"Error reading YAML file {args.inYaml}: {e}")
+        logger.error(f"Error loading YAML file {args.inYaml}: {e}")
         sys.exit(1)
 
     vrfsInYaml = {"conversion": set(), "leakTo": set()}
@@ -4304,6 +4376,8 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     perVrfPreExistingEsgMap = {}
     if not validateInputYamlData(esgDataFromYaml, vrfsInYaml, esgToVrfMap):
         sys.exit(1)
+    else:
+        logger.info("YAML file validation: PASS")
 
     # Conversion on APIC with script execution on APIC
     node = apicLoginGetNodeAndVersionCheck(args)
@@ -4349,8 +4423,10 @@ The generated configuration can be saved in XML or JSON format using the --outpu
         sys.exit(1)
 
     try:
-        generateConversionConfig(node, esgDataFromYaml, perVrfPreExistingEsgMap, args.outputFile, args.noConfig, \
-                                tcamOptimizedMode, contractConversionDescriptor, ConfigStrategy(args.configStrategy))
+        generateConversionConfig(node, esgDataFromYaml, perVrfPreExistingEsgMap,
+                                 args.outputFile, args.noConfig, tcamOptimizedMode,
+                                 contractConversionDescriptor, ConfigStrategy(args.configStrategy),
+                                 fabricDescriptor)
     except KeyboardInterrupt:
         print("\n\n")
         logger.info("ESGMigrationAssistant conversion interrupted by user")
