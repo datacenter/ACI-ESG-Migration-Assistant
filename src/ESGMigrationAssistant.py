@@ -11,7 +11,7 @@ import re
 import ipaddress
 from collections import defaultdict
 from util import RemoteCommandMo, chomp, parseDnStr, catchException, reportAFailure, Mo, Mit, ParserStub, globalValues,\
-     getNameFromDn, getTenantFromDn, getAppProfileFromDn, getL3OutFromDn, getPodIdFromDn, getNodeIdFromDn,\
+     getParentDn, getNameFromDn, getTenantFromDn, getAppProfileFromDn, getL3OutFromDn, getPodIdFromDn, getNodeIdFromDn,\
      isValidDn, getNewContractDn, getNewContractIfDn, getMgmtPFromDn, getRelationDescription, makeDn, spinner
 import pyaci
 from pyaci import Node
@@ -572,9 +572,9 @@ def waitForCondition(conditionFn, description, timeout, ih, checkInterval=1, onS
             sys.stdout.flush()
             userInput = ih.getInput("Configuration is taking more than {} seconds. Do you want to continue waiting (Y-Yes, N-No, Q-Quit): ".format(int(timeout)),
                                     ['y', 'n', 'q'])
-            if userInput == "q":
-                sys.exit(0)
-            elif userInput == "n":
+            if userInput == 'q':
+                raise KeyboardInterrupt
+            elif userInput == 'n':
                 logger.warning(f"Timeout waiting for {description}")
                 if onFailure:
                     onFailure()
@@ -656,7 +656,8 @@ def logAndPostHandler(outputElem, node, outputFile = None, noConfig = True, step
 
     userInput = inputHandler.getInput(prompt, validReply)
     if userInput == 'q':
-        sys.exit(0)
+        raise KeyboardInterrupt
+
     elif userInput == 'y' or userInput == 'a':
         try:
             # If the POST is failing, do not write the XML into outputFile
@@ -1280,6 +1281,8 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                     continue
                 if otherEpgDn in visitedEpgs:
                     continue
+                if otherEpgData['unsupportedFeatures']:
+                    continue
                 # EPGs are grouped together if:
                 # - mode is optimized
                 # - EPGs have same VRF
@@ -1294,17 +1297,9 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                    not otherEpgData['isUseg'] and \
                    prefGrMemb == otherEpgData['prefGrMemb'] and \
                    epgData['contracts'] == otherEpgData['contracts']:
-                    if otherEpgData['unsupportedFeatures']:
-                        lenOtherUnsupported = len(otherEpgData['unsupportedFeatures'])
-                        logger.error("Aborting analysis since EPG {} in VRF {} has unsupported features. The MO{} found referencing unsupported features {} {}."
-                                    .format(colored(epgDn), colored(vrfDn), "s" if lenOtherUnsupported > 1 else "",
-                                            "are" if lenOtherUnsupported > 1 else "is", colored(", ".join(sorted(otherEpgData['unsupportedFeatures'])))))
-                        sys.exit(1)
-
                     # EPG Selector is only created for AEPGs and l3extInstP
                     if isValidDn(otherEpgDn, ['uni', 'tn-', 'ap-', 'epg-']) or isValidDn(otherEpgDn, ['uni', 'tn-', 'out-', 'instP-']):
                         epgSelectors.add(otherEpgDn)
-                    visitedEpgs.add(otherEpgDn)
                     if otherEpgData['externalSubnets']:
                         externalSubnetSelectors.update(otherEpgData['externalSubnets'])
                     if otherEpgData['leakInternalSubnetsFromProv']:
@@ -1313,6 +1308,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                         leakInternalSubnetsFromCons.update(otherEpgData['leakInternalSubnetsFromCons'])
                     if otherEpgData['leakExternalPrefixes']:
                         leakExternalPrefixes.update(otherEpgData['leakExternalPrefixes'])
+                    visitedEpgs.add(otherEpgDn)
 
         if epgData['inbOrVzany'] or epgData['className'] == "fvESg":
             esgDn = epgDn
@@ -2427,18 +2423,13 @@ def listSnapshotCfgJobs(node, snapshotName, type='configexp'):
         return jobSet
 
     jobContMo = jobCont[0]
-
     for jobMo in jobContMo.Children:
         if jobMo.operSt not in {'pending', 'running'}:
-            jobSet.add((jobMo.fileName, jobMo.operSt, jobMo.details))
+            jobSet.add((jobMo.name, jobMo.fileName, jobMo.operSt, jobMo.details))
 
     return jobSet
 
-def dryrunConfigSnapshot(node, snapshotName):
-    logger = logging.getLogger(globalValues['logger'])
-
-    rc = ReturnCode.SUCCESS
-    snapshotStr = None
+def queryConfigSnapshot(node, snapshotName):
     dn = f"uni/backupst/snapshots-[uni/fabric/configexp-{snapshotName}]"
     params = {'rsp-subtree': 'full'}
     configSnapshotCont = callWithTokenRetry(node, node.mit.FromDn(dn).GET, **params)
@@ -2455,6 +2446,15 @@ def dryrunConfigSnapshot(node, snapshotName):
             })
     # Sort newest first
     configSnapshotList.sort(key=lambda x: x["time"], reverse=True)
+    return configSnapshotList
+
+def dryrunConfigSnapshot(node, snapshotName):
+    logger = logging.getLogger(globalValues['logger'])
+
+    rc = ReturnCode.SUCCESS
+    snapshotStr = None
+
+    configSnapshotList = queryConfigSnapshot(node, snapshotName)
 
     print()
     logger.info("There {} {} existing snapshot{} for {}:".format(
@@ -2488,6 +2488,44 @@ def dryrunConfigSnapshot(node, snapshotName):
         snapshotStr = configSnapshotList[selection - 1]['file']
 
     return rc, snapshotStr
+
+def restoreConfigSnapshot(node, snapshotName):
+    logger = logging.getLogger(globalValues['logger'])
+
+    snapshotNamePretty = snapshotName.replace("_", " ")
+
+    configSnapshotList = queryConfigSnapshot(node, snapshotName)
+    if configSnapshotList:
+        print()
+        logger.info("There {} {} existing rollback snapshot{} for {}".format(
+            "is" if len(configSnapshotList) == 1 else "are", len(configSnapshotList),
+            "" if len(configSnapshotList) == 1 else "s", snapshotNamePretty))
+        print()
+        logger.info("Please choose one of the existing rollback snapshots or quit without rolling back:")
+        for id, snap in enumerate(configSnapshotList, start=0):
+            logger.info(f"{id}. {snap['file']} — created at {snap['time']}")
+        print()
+        selection = None
+        rawChoice = None
+        while True:
+            try:
+                rawChoice = input("Make a selection by entering a number [{}{}] or Q-Quit: "
+                                    .format("0-" if len(configSnapshotList) > 1 else "", len(configSnapshotList) - 1))
+                selection = int(rawChoice)
+                if 0 <= selection < len(configSnapshotList):
+                    break
+                else:
+                    print("Invalid input.")
+            except ValueError:
+                if rawChoice and rawChoice.lower() == 'q':
+                    sys.exit(0)
+                print("Invalid input.")
+
+        inputHandler.lastUserInput = 'a'
+        restoreCfgSnapshot(node, configSnapshotList[selection]['file'])
+        inputHandler.reset()
+    else:
+        logger.info("No existing rollback snapshots found for {}.".format(snapshotNamePretty))
 
 def createCfgSnapshot(node, snapshotName):
     """
@@ -2531,7 +2569,7 @@ def createCfgSnapshot(node, snapshotName):
     )
 
     if result:
-        configFile, operSt, operDetails = result
+        _, configFile, operSt, operDetails = result
         if operSt != "success":
             logger.error(f"Snapshot creation failed with operSt {operSt}. Reason: {operDetails}")
             return ReturnCode.CONFIG_FAILED, None
@@ -2584,7 +2622,7 @@ def restoreCfgSnapshot(node, fileName):
     )
 
     if result:
-        configFile, operSt, operDetails = result
+        _, configFile, operSt, operDetails = result
         if operSt != "success":
             logger.error(f"Rollback failed with operSt {operSt}. Reason: {operDetails}")
             return ReturnCode.CONFIG_FAILED, None
@@ -2685,7 +2723,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     def logAndPost(outputElem, step = "", allowYesToAll = True):
         return logAndPostHandler(outputElem, node, outputFile = outputFile, noConfig = noConfig, step = step, allowYesToAll = allowYesToAll)
 
-    def createEsgAndLeakRouteForVrf(vrfData):
+    def createEsgAndLeakRouteForVrf(vrfData, leakRoute):
         vrfDn = vrfData['vrf']
         esgList = vrfData.get('esgs', [])
         leakInternalSubnets = vrfData.get('leakInternalSubnets', [])
@@ -2712,10 +2750,16 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
         # Create internal subnet leakroutes
         for leakInternalSubnet in leakInternalSubnets:
-            for leakVrf in leakInternalSubnet['leakTo']:
-                perVrfConfig.fvTenant(vrfTennantName).fvCtx(vrfName).leakRoutes()\
-                    .leakInternalSubnet(ip = leakInternalSubnet['ip'], scope = leakInternalSubnet['scope'])\
-                    .leakTo(ctxName=getNameFromDn(leakVrf), tenantName=getTenantFromDn(leakVrf), scope="inherit")
+            for leakToVrf in leakInternalSubnet['leakTo']:
+                preExisting = False
+                for existingLeak in leakRoute.get(leakToVrf, []):
+                    if existingLeak.overlaps(ipaddress.ip_network(leakInternalSubnet['ip'], strict=False)):
+                        preExisting = True
+                        break
+                if not preExisting:
+                    perVrfConfig.fvTenant(vrfTennantName).fvCtx(vrfName).leakRoutes()\
+                        .leakInternalSubnet(ip = leakInternalSubnet['ip'], scope = leakInternalSubnet['scope'])\
+                        .leakTo(ctxName=getNameFromDn(leakToVrf), tenantName=getTenantFromDn(leakToVrf), scope="inherit")
 
         # Create external prefix leakroutes
         for leakExternalPrefix in leakExternalPrefixes:
@@ -3251,6 +3295,23 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                                         preExistingEsgNewContractMap.setdefault(vrf, {})\
                                             .setdefault(esgDn, {}).setdefault('epgconsif', set()).add(contractIfDn)
 
+    def calculatePreExistingLeakRoutes():
+        spinner.text = "Calculating pre-existing leak routes"
+        returnData = {}
+        params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all'}
+        leakRoutesMos = callWithTokenRetry(node, node.methods.ResolveClass('leakRoutes').GET, **params)
+        for leakRoutesMo in leakRoutesMos:
+            vrfDn = getParentDn(leakRoutesMo.dn)
+            returnData[vrfDn] = {}
+            for child in leakRoutesMo.Children:
+                if child.ClassName == "leakInternalSubnet":
+                    network = ipaddress.ip_network(child.ip, strict=False)
+                    for grandChild in child.Children:
+                        if grandChild.ClassName == "leakTo":
+                            toVrfDn = grandChild.toCtxDn
+                            returnData[vrfDn].setdefault(toVrfDn, []).append(network)
+        return returnData
+
     def createEsgInbContractRelations():
         """
         Nested helper function
@@ -3476,6 +3537,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     #
 
     calculatePreExistingEsgContractRelations()
+    leakRoutes = calculatePreExistingLeakRoutes()
 
     returnCode = ReturnCode.SUCCESS
     logger.info(colored("----------------------------------------------------", bold=True))
@@ -3483,7 +3545,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     logger.info(colored("                       Contracts Clone", bold=True))
     logger.info(colored("----------------------------------------------------", bold=True))
     for vrf in sorted(esgDataForXml['vrfs'], key=lambda x: x['vrf']):
-        returnCode |= createEsgAndLeakRouteForVrf(vrf)
+        returnCode |= createEsgAndLeakRouteForVrf(vrf, leakRoutes.get(vrf['vrf'], {}))
 
     if returnCode not in [ReturnCode.SUCCESS, ReturnCode.USERSKIPPED]:
         logger.error("Configuration phase 1: ESGs and Leak Routes Creation did not complete successfully. Please check the logs. Return code: {}".format(returnCode))
@@ -3634,11 +3696,11 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         spinner.text = "Collecting External EPGs and subnets matching External Subnet selectors marked for cleanup"
         # Get all the existing External EPGs and their subnets if there are any external subnet selectors to clean up
         for extEpgMo in node.methods.ResolveClass('fvRtdEpPInfoHolder').GET(**{'rsp-subtree': 'children', 'rsp-prop-include': 'all'}):
-            vrfDn = extEpgMo.ctxDefDn.removeprefix("uni/ctx-[").removesuffix("]")
-            if vrfDn not in cleanupExternalSubnets: continue
             instPDn = extEpgMo.epgPKey
             instPToSubnetMap[instPDn] = set()
             instPToExtSubnetSelMap[instPDn] = set()
+            vrfDn = extEpgMo.ctxDefDn.removeprefix("uni/ctx-[").removesuffix("]")
+            if vrfDn not in cleanupExternalSubnets: continue
             for subnetMo in extEpgMo.Children:
                 if subnetMo.ClassName == 'l3extSubnetDef':
                     ip = ipaddress.ip_network(subnetMo.ip, strict=False)
@@ -3647,8 +3709,8 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                             # Exact match, mark for cleanup
                             instPToSubnetMap[instPDn].add(subnetMo.ip)
                             instPToExtSubnetSelMap[instPDn].add(extSubnetSelDn)
-                            if instPDn not in cleanupEPgs:
-                                cleanupEPgs[instPDn] = {"epgSelector": None, "vrfDn": vrfDn}
+            if instPDn not in cleanupEPgs:
+                cleanupEPgs[instPDn] = {"epgSelector": None, "vrfDn": vrfDn}
 
     lenCleanupEPgs = len(cleanupEPgs)
     logger.info("Found {} potential EPG{} to clean up".format(lenCleanupEPgs, '' if lenCleanupEPgs == 1 else 's'))
@@ -3761,7 +3823,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
             for epgChildren in epgMo.Children:
                 if epgChildren.ClassName == 'l3extSubnet':
                     scopeFlags = [flag.strip() for flag in epgChildren.scope.split(",")]
-                    if epgChildren.ip in instPToSubnetMap[epgDn]:
+                    if epgDn in instPToSubnetMap and epgChildren.ip in instPToSubnetMap[epgDn]:
                         scope = [flag for flag in scopeFlags if flag not in ['import-security', 'shared-security', 'shared-rtctrl']]
                         if len(scope) == 0:
                             for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
@@ -4128,7 +4190,7 @@ it may {} between the grouped EPGs.
 """.format(colored("allow unintended communication", color=None, bold=True, underline=True)))
 
     userInput = inputHandler.getInput("Do you want to continue (Y-Yes, Q-Quit): ", ['y', 'q'])
-    if userInput == "q":
+    if userInput == 'q':
         sys.exit(0)
 
     if args.fromApic or args.apic:
@@ -4411,8 +4473,9 @@ The generated configuration can be saved in XML or JSON format using the --outpu
         sys.exit(1)
 
     # Create config snapshot before doing conversion
+    snapshotName = TOOL_NAME_STR + "_Preconversion_Config"
     if not args.noConfig:
-        rc, snapshotStr = createCfgSnapshot(node, TOOL_NAME_STR + "_Preconversion_Config")
+        rc, _ = createCfgSnapshot(node, snapshotName)
         if rc not in [ReturnCode.SUCCESS, ReturnCode.USERSKIPPED]:
             logger.error("Config snapshot creation failed, aborting conversion")
             sys.exit(1)
@@ -4430,13 +4493,8 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     except KeyboardInterrupt:
         print("\n\n")
         logger.info("ESGMigrationAssistant conversion interrupted by user")
-        if not args.noConfig:
-            if snapshotStr:
-                restoreCfgSnapshot(node, snapshotStr)
-            else:
-                logger.info("If needed, please use APIC rollback feature to restore the configuration to a previous state")
-        sys.exit(1)
-
+        restoreConfigSnapshot(node, snapshotName)
+        sys.exit(0)
 
 def conversionValidate(args, parser):
     if not args.fromApic:
@@ -4536,8 +4594,9 @@ The generated configuration can be saved in XML or JSON format using the --outpu
         sys.exit(1)
 
     # Create config snapshot before doing cleanup
+    snapshotName = TOOL_NAME_STR + "_Precleanup_Config"
     if not args.noConfig:
-        rc, snapshotStr = createCfgSnapshot(node, TOOL_NAME_STR + "_Precleanup_Config")
+        rc, _ = createCfgSnapshot(node, snapshotName)
         if rc not in [ReturnCode.SUCCESS, ReturnCode.USERSKIPPED]:
             logger.error("Config snapshot creation failed, aborting cleanup")
             sys.exit(1)
@@ -4547,12 +4606,8 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     except KeyboardInterrupt:
         print("\n\n")
         logger.info("ESGMigrationAssistant cleanup interrupted by user")
-        if not args.noConfig:
-            if snapshotStr:
-                restoreCfgSnapshot(node, snapshotStr)
-            else:
-                logger.info("If needed, please use APIC rollback feature to restore the configuration to a previous state")
-        sys.exit(1)
+        restoreConfigSnapshot(node, snapshotName)
+        sys.exit(0)
 
 
 def cleanupValidate(args, parser):
@@ -4736,5 +4791,10 @@ if __name__ == "__main__":
         sys.exit(res)
     except KeyboardInterrupt:
         print("\n\nESGMigrationAssistant interrupted by user")
+        spinner.stop()
+        sys.exit(1)
+    except Exception as e:
+        logger = logging.getLogger(globalValues['logger'])
+        logger.exception("An unexpected error occurred: {}".format(e))
         spinner.stop()
         sys.exit(1)

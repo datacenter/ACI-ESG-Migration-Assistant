@@ -118,6 +118,17 @@ def getPodIdFromDn(dn):
         return match.group(1)
     return None  # Return None if no podId found
 
+@functools.cache
+def getParentDn(dn):
+    """
+    Extracts the parent distinguished name (DN) from a given DN.
+    For example, if the input DN is "uni/tn-foo/ap-ap1/epg-e1", the parent DN would be "uni/tn-foo/ap-ap1".
+    """
+    parts = dn.split('/')
+    if len(parts) > 1:
+        return '/'.join(parts[:-1])
+    return None  # Return None if no parent DN found
+
 def isValidDn(dn, rnList):
     """
     Validates if the given DN matches the expected RN list structure.
