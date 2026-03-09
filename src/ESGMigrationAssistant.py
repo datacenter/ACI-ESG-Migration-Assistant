@@ -25,6 +25,7 @@ import paramiko
 import tarfile
 import requests
 import urllib3
+import shutil
 
 TOOL_NAME_STR = "ESG_Migration_Assistant"
 ND_NAME_STR = "Nexus_Dashboard"
@@ -32,6 +33,8 @@ ND_NAME_STR = "Nexus_Dashboard"
 MINCMDALIASLEN = 4
 XMLPOST_LEVEL_NUM = 25
 CONFIG_TIMEOUT = 360  # 6 min
+MIN_FREE_BYTES = 200 * 1024 * 1024
+
 # ANSI color codes
 RESET = "\033[0m"
 RED = "\033[91m"
@@ -138,6 +141,11 @@ def downloadAciMetaFile(nodeUrl, args):
             logger.error("Please make sure URL {} is correct and the APIC is reachable.".format(nodeUrl))
             sys.exit(1)
 
+def refreshToken(node):
+    with open('/.aci/.sessions/.token') as f:
+        token = f.read().strip()
+    node.session.cookies["APIC-cookie"] = token
+
 def apicLoginGetNodeAndVersionCheck(args):
     logger = logging.getLogger(globalValues['logger'])
 
@@ -159,13 +167,10 @@ def apicLoginGetNodeAndVersionCheck(args):
             sys.exit(1)
     else:
         try:
-            with open('/.aci/.sessions/.token') as tokenF:
-                token = tokenF.read().strip()
+            refreshToken(node)
         except Exception as e:
             logger.error("Failed to read webtoken due to:\n{}".format(e))
             sys.exit(1)
-        # Add session token to node object
-        node.session.cookies["APIC-cookie"] = token
 
     # Version check
     # Version 6.1.4 and above supports external subnet selector and L3Out ESG
@@ -245,6 +250,7 @@ def loadMitFromPickle(pickleFile, inputFile):
         except Exception as e:
             logger.error("Met corrupted pickle file: {} with exception: {}".format(pickleFile, e))
             os.unlink(pickleFile)
+            mit = None
     return mit
 
 def writeMitToPickle(mit, pickleFile):
@@ -255,6 +261,7 @@ def writeMitToPickle(mit, pickleFile):
             logger.info("Wrote MIT to pickle file: {}".format(pickleFile))
     except Exception as e:
         logger.error("Failed to write MIT to pickle file: {} with exception: {}".format(pickleFile, e))
+        sys.exit(1)
 
 def xmlToMit(inXmlFile, args):
     logger = logging.getLogger(globalValues['logger'])
@@ -411,9 +418,25 @@ def snapshotToMit(inSnapJsonFileStr, path, args):
 
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(args.apic, username=args.username, password=args.password)
+    try:
+        ssh.connect(
+            args.apic,
+            username=args.username,
+            password=args.password,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=10,
+        )
+    except Exception as e:
+        logger.error(f"SSH error when connecting to APIC {args.apic}: {e}")
+        return None
 
-    sftp = ssh.open_sftp()
+    try:
+        sftp = ssh.open_sftp()
+    except Exception as e:
+        logger.error(f"Failed to open SFTP session: {e}")
+        ssh.close()
+        return None
 
     spinner.text = "Waiting for snapshot file to be ready"
     counter = 0
@@ -582,23 +605,38 @@ def waitForCondition(conditionFn, description, timeout, ih, checkInterval=1, onS
             else:
                 counter = 0  # reset timer and keep waiting
 
-def callWithTokenRetry(node, func, *args, **kwargs):
-    try:
-        return func(*args, **kwargs)
-    except Exception as e:
-        msg = str(e)
-        if ("Token was invalid" in msg or
-            "Token timeout" in msg or
-            'code="403"' in msg):
+RETRY_POLICIES = [
+    {
+        "patterns": ["Token was invalid", "Token timeout", 'code="403"'],
+        "retries": 1,
+        "action": refreshToken,
+    },
+    {
+        "patterns": ["Unable to deliver the message", "Resolve timeout", 'code="503"'],
+        "retries": 3,
+        "action": None,
+    },
+]
 
-            print("Session token expired, refreshing token and retrying...")
-
-            with open('/.aci/.sessions/.token') as f:
-                token = f.read().strip()
-            node.session.cookies["APIC-cookie"] = token
-            # retry once
+def callApiWithRetry(node, func, *args, **kwargs):
+    attempts = [0] * len(RETRY_POLICIES)
+    while True:
+        try:
             return func(*args, **kwargs)
-        raise
+        except Exception as e:
+            msg = str(e)
+            retry = False
+            for i, policy in enumerate(RETRY_POLICIES):
+                if any(p in msg for p in policy["patterns"]):
+                    if attempts[i] >= policy["retries"]:
+                        raise
+                    attempts[i] += 1
+                    if policy["action"]:
+                        policy["action"](node)
+                    retry = True
+                    break
+            if not retry:
+                raise
 
 def logAndPostHandler(outputElem, node, outputFile = None, noConfig = True, step = None, allowYesToAll = False):
     logger = logging.getLogger(globalValues['logger'])
@@ -663,11 +701,11 @@ def logAndPostHandler(outputElem, node, outputFile = None, noConfig = True, step
             # If the POST is failing, do not write the XML into outputFile
             # Exception will occur on validation failure
             if not noConfig:
-                callWithTokenRetry(node, outputElem.POST, format='xml')
+                callApiWithRetry(node, outputElem.POST, format='xml')
 
                 params = {'query-target-filter': 'eq(configpushTxCont.failedUpdate,"no")'}
                 def conditionFn():
-                    result = callWithTokenRetry(node, node.methods.ResolveClass('configpushTxCont').GET, **params)
+                    result = callApiWithRetry(node, node.methods.ResolveClass('configpushTxCont').GET, **params)
                     return not bool(result)  # True when push complete (no results)
 
                 def onSuccess(_):
@@ -1646,6 +1684,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 logger.info("Wrote ESG analysis to YAML file: {}".format(yamlOutputFile))
         except Exception as e:
             logger.error(f"Failed to write YAML file {yamlOutputFile}: {e}")
+            sys.exit(1)
 
     if showStats:
         vrfDescriptors = {}
@@ -1825,7 +1864,7 @@ def cloneNodeSubtree(apic, sourceDn, targetDn, overrideProps):
 
     logger = logging.getLogger(globalValues['logger'])
     params = {'rsp-subtree': 'full', 'rsp-prop-include': 'config-only'}
-    sourceSubtree = callWithTokenRetry(apic, apic.mit.FromDn(sourceDn).GET, **params)
+    sourceSubtree = callApiWithRetry(apic, apic.mit.FromDn(sourceDn).GET, **params)
 
     if sourceSubtree and len(sourceSubtree) > 0:
         source = sourceSubtree[0]
@@ -1868,7 +1907,7 @@ def validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap):
     spinner.text = "Validating existing ESG to VRF mapping"
 
     vrfConfigured = set()
-    result = callWithTokenRetry(node, node.methods.ResolveClass('fvCtx').GET, **{})
+    result = callApiWithRetry(node, node.methods.ResolveClass('fvCtx').GET, **{})
     for mo in result:
         vrfConfigured.add(mo.dn)
 
@@ -1879,7 +1918,7 @@ def validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap):
             return ReturnCode.VALIDATION_FAILED
 
     # Get all the fvRsScope. Each fvRsScope is created for each ESG and points to the VRF.
-    result = callWithTokenRetry(node, node.methods.ResolveClass('fvRsScope').GET, **{})
+    result = callApiWithRetry(node, node.methods.ResolveClass('fvRsScope').GET, **{})
     for mo in result:
         if mo.tDn:
             esgDn = mo.Parent.Dn
@@ -2305,7 +2344,7 @@ def capacityCheck(node, fabricDescriptor, vrfConversionSet, noConfig):
 
     # Get VRF to Node deployment
     if nodeCritical or nodeWarnings:
-        result = callWithTokenRetry(node, node.methods.ResolveClass('l3Ctx').GET, **{})
+        result = callApiWithRetry(node, node.methods.ResolveClass('l3Ctx').GET, **{})
         for mo in result:
             nodeId = getNodeIdFromDn(mo.dn)
             if nodeId and nodeId in nodeInfo:
@@ -2401,7 +2440,7 @@ def configpushPending(node):
     Returns number of pending config pushes.
     """
     params = {'query-target-filter': 'eq(configpushTxCont.failedUpdate,"no")'}
-    pendingJobs = callWithTokenRetry(node, node.methods.ResolveClass('configpushTxCont').GET, **params)
+    pendingJobs = callApiWithRetry(node, node.methods.ResolveClass('configpushTxCont').GET, **params)
     if pendingJobs:
         return len(pendingJobs)
     return 0
@@ -2415,7 +2454,7 @@ def listSnapshotCfgJobs(node, snapshotName, type='configexp'):
     """
     dn = f"uni/backupst/jobs-[uni/fabric/{type}-{snapshotName}]"
     params = {'rsp-subtree': 'full'}
-    jobCont = callWithTokenRetry(node, node.mit.FromDn(dn).GET, **params)
+    jobCont = callApiWithRetry(node, node.mit.FromDn(dn).GET, **params)
     jobSet = set()
 
     # Job not yet created
@@ -2424,15 +2463,14 @@ def listSnapshotCfgJobs(node, snapshotName, type='configexp'):
 
     jobContMo = jobCont[0]
     for jobMo in jobContMo.Children:
-        if jobMo.operSt not in {'pending', 'running'}:
-            jobSet.add((jobMo.name, jobMo.fileName, jobMo.operSt, jobMo.details))
+        jobSet.add(jobMo.Dn)
 
     return jobSet
 
 def queryConfigSnapshot(node, snapshotName):
     dn = f"uni/backupst/snapshots-[uni/fabric/configexp-{snapshotName}]"
     params = {'rsp-subtree': 'full'}
-    configSnapshotCont = callWithTokenRetry(node, node.mit.FromDn(dn).GET, **params)
+    configSnapshotCont = callApiWithRetry(node, node.mit.FromDn(dn).GET, **params)
 
     configSnapshotList = []
     if configSnapshotCont and len(configSnapshotCont) > 0:
@@ -2553,12 +2591,23 @@ def createCfgSnapshot(node, snapshotName):
         logger.error("Snapshot creation failed")
         return rc, None
 
-    def conditionFn():
+    exportConfigJob = set()
+    while len(exportConfigJob) != 1:
         postExportConfigJobs = listSnapshotCfgJobs(node, snapshotName)
-        exportConfigJobDelta = postExportConfigJobs - preExportConfigJobs
-        if not exportConfigJobDelta:
-            return None  # not ready yet
-        return exportConfigJobDelta.pop()
+        exportConfigJob = postExportConfigJobs - preExportConfigJobs
+    configJobDn = exportConfigJob.pop()
+
+    def conditionFn():
+        try:
+            job = callApiWithRetry(node, node.mit.FromDn(configJobDn).GET, **{})
+            if job and len(job) > 0:
+                jobMo = job[0]
+                if jobMo.operSt in ['pending', 'running']:
+                    return None  # not completed yet
+                return (jobMo.fileName, jobMo.operSt, jobMo.details)
+        except Exception as e:
+            logger.error(f"Error while checking snapshot job status: {e}")
+        return None
 
     result = waitForCondition(
         conditionFn = conditionFn,
@@ -2569,7 +2618,7 @@ def createCfgSnapshot(node, snapshotName):
     )
 
     if result:
-        _, configFile, operSt, operDetails = result
+        configFile, operSt, operDetails = result
         if operSt != "success":
             logger.error(f"Snapshot creation failed with operSt {operSt}. Reason: {operDetails}")
             return ReturnCode.CONFIG_FAILED, None
@@ -2606,12 +2655,23 @@ def restoreCfgSnapshot(node, fileName):
         logger.error("Rollback job failed")
         return rc, None
 
-    def conditionFn():
+    importConfigJob = set()
+    while len(importConfigJob) != 1:
         postImportConfigJobs = listSnapshotCfgJobs(node, "default", type='configimp')
-        importConfigJobDelta = postImportConfigJobs - preImportConfigJobs
-        if not importConfigJobDelta:
-            return None  # not ready yet
-        return importConfigJobDelta.pop()
+        importConfigJob = postImportConfigJobs - preImportConfigJobs
+    configJobDn = importConfigJob.pop()
+
+    def conditionFn():
+        try:
+            job = callApiWithRetry(node, node.mit.FromDn(configJobDn).GET, **{})
+            if job and len(job) > 0:
+                jobMo = job[0]
+                if jobMo.operSt in ['pending', 'running']:
+                    return None  # not completed yet
+                return (jobMo.fileName, jobMo.operSt, jobMo.details)
+        except Exception as e:
+            logger.error(f"Error while checking rollback job status: {e}")
+        return None
 
     result = waitForCondition(
         conditionFn = conditionFn,
@@ -2622,7 +2682,7 @@ def restoreCfgSnapshot(node, fileName):
     )
 
     if result:
-        _, configFile, operSt, operDetails = result
+        configFile, operSt, operDetails = result
         if operSt != "success":
             logger.error(f"Rollback failed with operSt {operSt}. Reason: {operDetails}")
             return ReturnCode.CONFIG_FAILED, None
@@ -2714,7 +2774,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
              'contractClones': {'current': 1, 'total': len(esgDataForXml['contractClones'])}}
 
     try:
-        with open(outputFile, "w") as f:
+        with open(outputFile, "w") as _:
             pass
     except Exception as e:
         logger.error("Failed to open file {} due to {}".format(outputFile, e))
@@ -2987,7 +3047,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
             oldPcTag = 0
             if not epgToNodeToPcTag["executed"]:
                 spinner.text = "Collecting EPG selector configuration on nodes (vlanCktEp objects)"
-                concreteResult = callWithTokenRetry(node, node.methods.ResolveClass('vlanCktEp').GET, **{})
+                concreteResult = callApiWithRetry(node, node.methods.ResolveClass('vlanCktEp').GET, **{})
                 epgToNodeToPcTag["executed"] = True
                 for vlanCktEpMo in concreteResult:
                     epgToNodeToPcTag.setdefault(vlanCktEpMo.epgDn, {})[vlanCktEpMo.dn] = int(vlanCktEpMo.pcTag)
@@ -3033,7 +3093,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 # Keep the logic simple and skip waiting for these prefixes
                 return True
             params = {'query-target-filter': 'eq(actrlPfxEntry.addr,"{}")'.format(subnet['ip'])}
-            concreteResult = callWithTokenRetry(node, node.methods.ResolveClass('actrlPfxEntry').GET, **params)
+            concreteResult = callApiWithRetry(node, node.methods.ResolveClass('actrlPfxEntry').GET, **params)
             for mo in concreteResult:
                 if str(seg) not in mo.dn:
                     continue
@@ -3112,7 +3172,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         # Post Temporary External EPG selector config to minimize the traffic impact
         if applyConfig and len(list(instPSelectorsConfigPatch.Children)):
             try:
-                callWithTokenRetry(node, instPSelectorsConfigPatch.POST, format='xml')
+                callApiWithRetry(node, instPSelectorsConfigPatch.POST, format='xml')
             except Exception as e:
                 pass
 
@@ -3197,7 +3257,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         # Post Delete of External EPG selector config used to minimize the traffic impact
         if applyConfig and len(list(instPSelectorsDeletePatch.Children)):
             try:
-                callWithTokenRetry(node, instPSelectorsDeletePatch.POST, format='xml')
+                callApiWithRetry(node, instPSelectorsDeletePatch.POST, format='xml')
             except Exception as e:
                 pass
 
@@ -3212,7 +3272,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
         spinner.text = "Analyze/Create PBR Logical Device Context for ESGs in scope of conversion"
         configToPost = []
-        vnsLDevCtxMos = callWithTokenRetry(node, node.methods.ResolveClass('vnsLDevCtx').GET, **{})
+        vnsLDevCtxMos = callApiWithRetry(node, node.methods.ResolveClass('vnsLDevCtx').GET, **{})
         for vnsLDevCtxMo in vnsLDevCtxMos:
             pbrCtxTenant = getTenantFromDn(vnsLDevCtxMo.dn)
             pbrCtrctName = vnsLDevCtxMo.ctrctNameOrLbl
@@ -3240,7 +3300,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         for vrf in perVrfPreExistingEsgMap:
             for esgDn in perVrfPreExistingEsgMap[vrf]:
                 params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all'}
-                sourceSubtree = callWithTokenRetry(node, node.mit.FromDn(esgDn).GET, **params)
+                sourceSubtree = callApiWithRetry(node, node.mit.FromDn(esgDn).GET, **params)
                 if not sourceSubtree or len(sourceSubtree) == 0:
                     logger.error(f"Unable to retreive information related to pre-existing ESG {esgDn}")
                     continue
@@ -3270,7 +3330,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                                 preExistingEsgNewContractMap.setdefault(vrf, {})\
                                     .setdefault(esgDn, {}).setdefault('consif', set()).add(contractIfDn)
                     elif child.ClassName == "fvEPgSelector":
-                        epgSourceSubtree = callWithTokenRetry(node, node.mit.FromDn(child.matchEpgDn).GET, **{'rsp-subtree': 'children', 'rsp-prop-include': 'all'})
+                        epgSourceSubtree = callApiWithRetry(node, node.mit.FromDn(child.matchEpgDn).GET, **{'rsp-subtree': 'children', 'rsp-prop-include': 'all'})
                         if not epgSourceSubtree or len(epgSourceSubtree) == 0:
                             logger.error(f"Unable to retreive information related to pre-existing ESG {esgDn}")
                             continue
@@ -3299,7 +3359,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         spinner.text = "Calculating pre-existing leak routes"
         returnData = {}
         params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all'}
-        leakRoutesMos = callWithTokenRetry(node, node.methods.ResolveClass('leakRoutes').GET, **params)
+        leakRoutesMos = callApiWithRetry(node, node.methods.ResolveClass('leakRoutes').GET, **params)
         for leakRoutesMo in leakRoutesMos:
             vrfDn = getParentDn(leakRoutesMo.dn)
             returnData[vrfDn] = {}
@@ -3322,7 +3382,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         spinner.text = "Analyze/Create Inband contract relations configuration"
         configToPost = []
         params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all'}
-        inbMos = callWithTokenRetry(node, node.methods.ResolveClass('mgmtInB').GET, **params)
+        inbMos = callApiWithRetry(node, node.methods.ResolveClass('mgmtInB').GET, **params)
         for inbMo in inbMos:
             tenantName = getTenantFromDn(inbMo.dn)
             mgmtPName = getMgmtPFromDn(inbMo.dn)
@@ -3393,7 +3453,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         spinner.text = "Analyze/Create vzAny contract relations configuration"
         configToPost = []
         params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all'}
-        vzAnyMos = callWithTokenRetry(node, node.methods.ResolveClass('vzAny').GET, **params)
+        vzAnyMos = callApiWithRetry(node, node.methods.ResolveClass('vzAny').GET, **params)
         for vzAnyMo in vzAnyMos:
             tenantName = getTenantFromDn(vzAnyMo.dn)
             vrfName = getNameFromDn(vzAnyMo.dn)
@@ -3463,7 +3523,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         Fills the vrfToSeg dictionary.
         """
         def conditionFn():
-            results = callWithTokenRetry(node, node.mit.FromDn(vrf).GET, **{})
+            results = callApiWithRetry(node, node.mit.FromDn(vrf).GET, **{})
             if results and len(results) > 0 and results[0].seg != "any":
                 return int(results[0].seg)
             return None
@@ -3508,7 +3568,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
         def conditionFn():
             if len(esgDns) > 0:
-                for esgMo in callWithTokenRetry(node, node.methods.ResolveClass('fvESg').GET, **{}):
+                for esgMo in callApiWithRetry(node, node.methods.ResolveClass('fvESg').GET, **{}):
                     if esgMo.pcTag != "any":
                         esgToPcTag[esgMo.dn] = int(esgMo.pcTag)
                         esgDns.discard(esgMo.dn)
@@ -3651,7 +3711,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         """
         matchingMos = []
         params = {'rsp-subtree': 'children', 'rsp-subtree-class': 'tagAnnotation', 'rsp-subtree-include': 'required'}
-        mos = callWithTokenRetry(node, node.methods.ResolveClass(className).GET, **params)
+        mos = callApiWithRetry(node, node.methods.ResolveClass(className).GET, **params)
 
         for mo in mos:
             if skipConfigIssues and getattr(mo, "configIssues", None):
@@ -3665,7 +3725,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         return matchingMos
 
     try:
-        with open(outputFile, "w") as f:
+        with open(outputFile, "w") as _:
             pass
     except Exception as e:
         logger.error("Failed to open file {} due to {}".format(outputFile, e))
@@ -3735,7 +3795,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
 
         params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all',
                   'rsp-subtree-class': 'fvRsBd,fvRsProv,fvRsCons,fvRsIntraEpg,fvRsConsIf,fvRsSecInherited,fvSubnet,fvEpNlb,fvEpAnycast,fvEpReachability,l3extSubnet'}
-        sourceSubtree = callWithTokenRetry(node, node.mit.FromDn(epgDn).GET, **params)
+        sourceSubtree = callApiWithRetry(node, node.mit.FromDn(epgDn).GET, **params)
         if not sourceSubtree or len(sourceSubtree) == 0:
             logger.error(f"There is an Selector configured for EPG {epgDn}, but the EPG does not exist. Skipping cleanup of this EPG.")
             continue
@@ -3868,7 +3928,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
     spinner.text = "Analyzing configuration for Inband EPG"
     # Cleanup contract relations to InB epgs which have tags to be deleted
     params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all'}
-    inbMos = callWithTokenRetry(node, node.methods.ResolveClass('mgmtInB').GET, **params)
+    inbMos = callApiWithRetry(node, node.methods.ResolveClass('mgmtInB').GET, **params)
     for inbMo in inbMos:
         eppDn = 'uni/epp/inb-[{}]'.format(inbMo.dn)
         eppRequest = node.mit.FromDn(eppDn).GET()
@@ -3914,7 +3974,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
     for fvESgMo in fvESgMos:
         esgDn = fvESgMo.dn
         params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all'}
-        fvESgSubtree = callWithTokenRetry(node, node.mit.FromDn(esgDn).GET, **params)
+        fvESgSubtree = callApiWithRetry(node, node.mit.FromDn(esgDn).GET, **params)
         if not fvESgSubtree or len(fvESgSubtree) == 0:
             continue
         for child in fvESgSubtree[0].Children:
@@ -3970,7 +4030,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
             config.fvTenant(tenantName).fvCtx(vrfName).vzAny().tagAnnotation(key=migrationAnnotateKey, status="deleted")
 
         params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all'}
-        vzAnySubtree = callWithTokenRetry(node, node.mit.FromDn(vzAnyMo.dn).GET, **params)
+        vzAnySubtree = callApiWithRetry(node, node.mit.FromDn(vzAnyMo.dn).GET, **params)
         if not vzAnySubtree or len(vzAnySubtree) == 0:
             continue
         for child in vzAnySubtree[0].Children:
@@ -4046,7 +4106,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
 
         params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all',
                'rsp-subtree-class': 'vzRtCons,vzRtProv,vzRtIntraEpg,vzRtConsIf,vzRtAnyToCons,vzRtAnyToProv,vzRtAnyToConsIf'}
-        sourceSubtree = callWithTokenRetry(node, node.mit.FromDn(contract).GET, **params)
+        sourceSubtree = callApiWithRetry(node, node.mit.FromDn(contract).GET, **params)
         if not sourceSubtree or len(sourceSubtree) == 0:
             logger.error(f"Error in retrieving and cleaning up contract {contract} on {tenant}. Skipping cleanup of this contract.")
             spinner.text = "Analyzing configuration for contract {}/{}: {}".format(contractNum, contractNumTot, contract)
@@ -4102,7 +4162,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
     cleanupSequence = []
     globalConfigToPost = node.mit.polUni()
     perTenantConfigToPost = {}
-    vnsLDevCtxMos = callWithTokenRetry(node, node.methods.ResolveClass('vnsLDevCtx').GET, **{})
+    vnsLDevCtxMos = callApiWithRetry(node, node.methods.ResolveClass('vnsLDevCtx').GET, **{})
     for vnsLDevCtxMo in vnsLDevCtxMos:
         perContractConfig = node.mit.polUni()
         vnsTenant = getTenantFromDn(vnsLDevCtxMo.Dn)
@@ -4165,7 +4225,7 @@ The Dryrun can be executed in two modes:
   - one-to-one: each EPG is assigned to its own ESG.
   - optimized: EPGs with identical contract layout are grouped into the same ESG.
 
-The optimized mode analisys reduces the number of ESGs created, it reduces the final TCAM
+The optimized mode analysis reduces the number of ESGs created, it reduces the final TCAM
 utilization and it will allow communication between the grouped EPGs.
 If communication between the grouped EPGs is not desired and existing contracts and security
 layout must be preserved, the one-to-one mode is the recommended approach.
@@ -4772,6 +4832,12 @@ def main():
 
     logging.debug("Logging initialized.")
     logging.debug("Parsed arguments: {}".format(args))
+
+    usage = shutil.disk_usage('.')
+    logging.debug("Checking disk space: Total: {:.2f} GB, Used: {:.2f} GB, Free: {:.2f} GB".format(usage.total/1024/1024/1024, usage.used/1024/1024/1024, usage.free/1024/1024/1024))
+    if usage.free < MIN_FREE_BYTES:
+        logger.error(f"Not enough free disk space to run the tool. Required: {MIN_FREE_BYTES/1024/1024} MB, Available: {usage.free/1024/1024} MB")
+        sys.exit(1)
 
     # PDB
     if args.pdb:
