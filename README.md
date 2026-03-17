@@ -40,8 +40,10 @@ The migration is implemented in three parts
 1. Dryrun analyze the user config and group similar EPGs into ESGs. The analysis is outputted to a YAML file. Script usage is as follows -
 ```
 ./ESGMigrationAssistant dryrun --help
-usage: ESGMigrationAssistant dryrun [-h] [--json JSON | --xml XML | --targz TARGZ | --dbxml DBXML] [--disableNdMode] 
-                                    [--apic APIC] [--username USERNAME] [--password PASSWORD] [--mode {optimized,one-to-one}] [--tenantdns TENANTDNS] [--vrfdns VRFDNS] [--outYaml OUTYAML] [--prefix PREFIX] [--suffix SUFFIX] [--showStats]
+usage: ESGMigrationAssistant dryrun [-h] [--json JSON | --xml XML | --targz TARGZ | --dbxml DBXML] [--disableNdMode]
+                                    [--apic APIC] [--username USERNAME] [--password PASSWORD] [--mode {optimized,one-to-one}]
+                                    [--tenantdns TENANTDNS] [--vrfdns VRFDNS] [--tenantRegex TENANTREGEX] [--outYaml OUTYAML]
+                                    [--prefix PREFIX] [--suffix SUFFIX] [--showStats]
 
 options:
   -h, --help            show this help message and exit
@@ -56,14 +58,16 @@ options:
   --mode {optimized,one-to-one}
                         Select the mode of analysis: optimized (default) or one-to-one
   --tenantdns TENANTDNS
-                        Filter the analysis to all VRFs within the specified Tenants. Provide a comma-separated list of Tenant DNs (no spaces). Example: uni/tn-T1,uni/tn-T2. May be combined with --vrfdns; both filters apply using AND logic.
-  --vrfdns VRFDNS       Filter the analysis to the specified VRFs. Provide a comma-separated list of VRF DNs (no 
-                        spaces). Example: uni/tn-T1/ctx-ctx1,uni/tn-T2/ctx-ctx2. May be combined with --tenantdns; both filters apply using AND logic.
+                        Filter the analysis to all VRFs within the specified Tenants. Provide a comma-separated list of Tenant DNs (no spaces).
+                        Example: uni/tn-T1,uni/tn-T2. May be combined with other filters; all filters apply using UNION logic.
+  --vrfdns VRFDNS       Filter the analysis to the specified VRFs. Provide a comma-separated list of VRF DNs (no spaces).
+                        Example: uni/tn-T1/ctx-ctx1,uni/tn-T2/ctx-ctx2. May be combined with other filters; all filters apply using UNION logic.
+  --tenantRegex TENANTREGEX
+                        Filter by tenant name. Provide a comma-separated list of names or regex (no spaces).
+                        Example: T1,T2,Prod.*,Test[0-9]+. May be combined with other filters; all filters apply using UNION logic.
   --outYaml OUTYAML     YAML file in which we report the execution plan
-  --prefix PREFIX       Prefix to add to cloned names (default: empty). Example: contract name is "web" and prefix is 
-                        "e", cloned contract will be named "e_web"
-  --suffix SUFFIX       Suffix to add to cloned names (default: e). Example: contract name is "web" and suffix is "e", 
-                        cloned contract will be named "web_e"
+  --prefix PREFIX       Prefix to add to cloned names (default: empty). Example: contract name is "web" and prefix is "e", cloned contract will be named "e_web"
+  --suffix SUFFIX       Suffix to add to cloned names (default: e). Example: contract name is "web" and suffix is "e", cloned contract will be named "web_e"
   --showStats           Show statistics about the Fabric Config.
 ```
 

@@ -18,9 +18,6 @@ from pyaci import Node
 import time
 from datetime import datetime
 from enum import IntFlag, Enum
-from pygments import highlight
-from pygments.lexers import XmlLexer
-from pygments.formatters import TerminalFormatter
 import paramiko
 import tarfile
 import requests
@@ -39,6 +36,7 @@ MIN_FREE_BYTES = 200 * 1024 * 1024
 RESET = "\033[0m"
 RED = "\033[91m"
 YELLOW = "\033[33m"
+CYAN = "\033[36m"
 BLUE = "\033[94m"
 GREEN = "\033[92m"
 MAGENTA = "\033[95m"
@@ -46,6 +44,7 @@ BOLD_RED = "\033[1;91m"
 BOLD_YELLOW = "\033[1;33m"
 BOLD_BLUE = "\033[1;94m"
 BOLD_MAGENTA = "\033[1;95m"
+GREY = "\033[37m"
 
 class ReturnCode(IntFlag):
     SUCCESS = 0
@@ -747,6 +746,16 @@ def logAndPostHandler(outputElem, node, outputFile = None, noConfig = True, step
     print()
     return rc
 
+def parseRegexFilters(value):
+    patterns = []
+    for item in value:
+        item = item.strip()
+        # Treat plain names as exact match
+        if not any(c in item for c in ".*+?[](){}|^$"):
+            item = f"^{re.escape(item)}$"
+        patterns.append(re.compile(item))
+    return patterns
+
 def buildReverseRelation(parentDn: str, targetDn: str, className: str):
     """
     Build the DN and properties for a reverse relation (fvRt*, vzRt*, etc.)
@@ -821,7 +830,7 @@ def relationFramework(mit):
 #########################################################
 # DRY RUN PHASE
 #########################################################
-def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nameSuffix, filterVrfDns=[], filterTenantDns=[], showStats=False):
+def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nameSuffix, filterVrfDns=[], filterTenantDns=[], filterTenantRegex=[], showStats=False):
 
     if namePrefix:
         namePrefix = namePrefix + "_"
@@ -898,6 +907,19 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
 
     logger = logging.getLogger(globalValues['logger'])
 
+    # Pre-Collect l3extOuts to ignore based on vxlanExtP and mplsExtP presence
+    ignoredL3Out = set()
+    iter = mit.lookupByClass('vxlanExtP')
+    if iter:
+        for vxlanExtPDn, _ in iter:
+            l3OutDn = getParentDn(vxlanExtPDn)
+            ignoredL3Out.add(l3OutDn)
+    iter = mit.lookupByClass('mplsExtP')
+    if iter:
+        for mplsExtPDn, _ in iter:
+            l3OutDn = getParentDn(mplsExtPDn)
+            ignoredL3Out.add(l3OutDn)
+
     #
     # Step 1: collect all the EPGs in the system. If there are no EPGs, stop the analysis
     #
@@ -911,7 +933,10 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     # External EPGs
     l3extInstpMos = mit.lookupByClass('l3extInstP')
     if l3extInstpMos:
-        allEpgMos.extend(l3extInstpMos)
+        for l3extInstpDn, l3extInstpMo in l3extInstpMos:
+            l3extOutDn = getParentDn(l3extInstpDn)
+            if l3extOutDn not in ignoredL3Out:
+                allEpgMos.append((l3extInstpDn, l3extInstpMo))
     else:
         logger.info("No l3extInstP found.")
     # MgmtInB EPGs
@@ -957,19 +982,30 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     perVrfExternalSubnetSelectors = {}
     contractToFilterDescriptor = {}
 
-    noFiltersUsed = not filterVrfDns and not filterTenantDns
+    noFiltersUsed = not filterVrfDns and not filterTenantDns and not filterTenantRegex
     filtersUsed = not noFiltersUsed
+    aggregateFilterVrfDns = set(filterVrfDns)
 
     # Pre-Collect VRFs assigned to tenant in filter lists
+    parsedFilterTenantRegex = parseRegexFilters(filterTenantRegex) if filterTenantRegex else []
     iter = mit.lookupByClass('fvCtx')
     if iter:
         logger.debug("Found {} VRFs.".format(len(iter)))
         for ctxDn, _ in iter:
-            tenantName = getTenantFromDn(ctxDn)
-            tenantDn = "uni/tn-{}".format(tenantName)
+            if ctxDn in aggregateFilterVrfDns:
+                continue
+            tenantDn = getParentDn(ctxDn)
             if tenantDn in filterTenantDns:
-                if ctxDn not in filterVrfDns:
-                    filterVrfDns.append(ctxDn)
+                aggregateFilterVrfDns.add(ctxDn)
+            else:
+                tenantName = getTenantFromDn(tenantDn)
+                if any(p.search(tenantName) for p in parsedFilterTenantRegex):
+                    aggregateFilterVrfDns.add(ctxDn)
+
+    tenantsInvolved = set()
+    for vrfDn in aggregateFilterVrfDns:
+        tenantName = getTenantFromDn(vrfDn)
+        tenantsInvolved.add(tenantName)
     # Pre-Collect BD to CTX mapping for fvAEPg
     iter = mit.lookupByClass('fvBD')
     if iter:
@@ -1241,7 +1277,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
 
             epgLayout[epgDn] = epgDescriptor
 
-            if noFiltersUsed or epgDescriptor['vrf'] in filterVrfDns:
+            if noFiltersUsed or epgDescriptor['vrf'] in aggregateFilterVrfDns:
                 externalSubnetLayout.setdefault(epgDescriptor['vrf'], {})
                 for subnet in epgDescriptor['externalSubnets']:
                     ip = subnet[0]
@@ -1255,7 +1291,14 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 externalSubnetLayout[epgDescriptor['vrf']][epgDn] = epgDescriptor['externalSubnets']
 
         else:
-            logger.warning("Skipping MO {} since it has no VRF assigned.".format(epgDn))
+            tenantName = getTenantFromDn(epgDn)
+            if tenantsInvolved:
+                for tenantInvolved in tenantsInvolved:
+                    if tenantName == tenantInvolved:
+                        logger.warning("Skipping MO {} since it has no VRF assigned.".format(epgDn))
+                        break
+            else:
+                logger.warning("Skipping MO {} since it has no VRF assigned.".format(epgDn))
 
     for epgDn, masterDns in inheritedFrom.items():
         processInheritedContracts(epgDn, masterDns)
@@ -1273,17 +1316,13 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     logger.info(colored("RESULTS - Mode {}".format(mode), bold=True))
     logger.info(colored("------------------------------------", bold=True))
     for epgDn, epgData in epgLayout.items():
-        if epgData['ignoreMigration']:
-            continue
         vrfDn = epgData['vrf']
-        if (not epgData['contracts']) and (vrfDn not in vrfsWithVzAnyContract):
-            continue
-        tenantName = epgData['epgTennant']
-        pcEnfPref = epgData['pcEnfPref']
-        prefGrMemb = epgData['prefGrMemb']
-        if filtersUsed and vrfDn not in filterVrfDns:
-            continue
-        if epgDn in visitedEpgs:
+        if (epgData['ignoreMigration']) or \
+           (not epgData['contracts'] and vrfDn not in vrfsWithVzAnyContract) or \
+           (filtersUsed and vrfDn not in aggregateFilterVrfDns) or \
+           (epgDn in visitedEpgs):
+            if not spinner.isRunning():
+                spinner.text = "Analyzing EPGs"
             continue
         if epgData['unsupportedFeatures']:
             lenUnsupported = len(epgData['unsupportedFeatures'])
@@ -1291,6 +1330,9 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                          .format(colored(epgDn), colored(vrfDn),
                                  "are" if lenUnsupported > 1 else "is", colored(", ".join(sorted(epgData['unsupportedFeatures'])))))
             sys.exit(1)
+        tenantName = epgData['epgTennant']
+        pcEnfPref = epgData['pcEnfPref']
+        prefGrMemb = epgData['prefGrMemb']
         epgSelectors = set()
         externalSubnetSelectors = set()
         leakInternalSubnetsFromProv = set()
@@ -1315,11 +1357,9 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
            not epgData['isUseg'] and \
            not epgData['inbOrVzany']:
             for otherEpgDn, otherEpgData in epgLayout.items():
-                if otherEpgData['ignoreMigration']:
-                    continue
-                if otherEpgDn in visitedEpgs:
-                    continue
-                if otherEpgData['unsupportedFeatures']:
+                if (otherEpgData['ignoreMigration']) or \
+                   (otherEpgDn in visitedEpgs) or \
+                   (otherEpgData['unsupportedFeatures']):
                     continue
                 # EPGs are grouped together if:
                 # - mode is optimized
@@ -1424,8 +1464,8 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
         if epgData['className'] == "fvESg":
             continue
 
-        if filterVrfDns:
-            missingVrfs = (leakToConsumerVrfs | leakToProviderVrfs) - set(filterVrfDns)
+        if aggregateFilterVrfDns:
+            missingVrfs = (leakToConsumerVrfs | leakToProviderVrfs) - aggregateFilterVrfDns
             if missingVrfs:
                 text = "\nEPGs in VRF {} are configured with shared services pointing to VRFs that are not included in the current VRF or Tenant filter lists.\n".format(vrfDn)
                 text += "The missing target VRF{}: {}\n".format('s are' if len(missingVrfs) > 1 else ' is', ','.join(sorted(list(missingVrfs))))
@@ -1434,23 +1474,22 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 text += "  2) Add the corresponding Tenants to the Tenant filter list, or\n"
                 text += "  3) Run the script for the entire Fabric without using any VRF/Tenant filters.\n"
                 text += "Filter lists can be combined.\n"
-                text += "Current filter used:\n "
+                text += "Current filter used:\n"
                 if filterTenantDns:
-                    text += "--tenantdns {} ".format(",".join(filterTenantDns))
-                filteredVrfs = [
-                    vrf for vrf in filterVrfDns
-                    if not any(vrf.startswith(tenant + "/") for tenant in filterTenantDns)
-                ]
-                if filteredVrfs:
-                    text += "--vrfdns {}".format(",".join(filteredVrfs))
-                text += "\nNew suggested filter:\n "
+                    text += " --tenantdns {}".format(",".join(filterTenantDns))
+                if filterTenantRegex:
+                    text += " --tenantRegex {}".format(",".join(filterTenantRegex))
+                if filterVrfDns:
+                    text += " --vrfdns {}".format(",".join(filterVrfDns))
+                text += "\nNew suggested filter:\n"
                 if filterTenantDns:
-                    text += "--tenantdns {} ".format(",".join(filterTenantDns))
-                filteredVrfs = [
-                    vrf for vrf in set(filterVrfDns) | missingVrfs
-                    if not any(vrf.startswith(tenant + "/") for tenant in filterTenantDns)
-                ]
-                text += "--vrfdns {}".format(",".join(filteredVrfs))
+                    text += " --tenantdns {}".format(",".join(filterTenantDns))
+                if filterTenantRegex:
+                    text += " --tenantRegex {}".format(",".join(filterTenantRegex))
+                filteredVrfs = filterVrfDns
+                for vrf in missingVrfs:
+                    filteredVrfs.append(vrf)
+                text += " --vrfdns {}".format(",".join(filteredVrfs))
                 logger.error(text)
                 sys.exit(1)
 
@@ -1556,7 +1595,9 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     # Sort the leak subnets and prefixes and the contract clones for consistent output
     # Get the list of contracts references
     # Cleanup unused fields
+    migratedVrfDns = set()
     for vrf in jsonResult['vrfs']:
+        migratedVrfDns.add(vrf['vrf'])
         vrf['leakInternalSubnets'] = sorted(vrf['leakInternalSubnets'], key=lambda x: x['ip'])
         vrf['leakExternalPrefixes'] = sorted(vrf['leakExternalPrefixes'], key=lambda x: x['ip'])
         vrf['esgs'] = sorted(vrf['esgs'], key=lambda x: x['name'])
@@ -1671,13 +1712,23 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 if not esg[key]:
                     del esg[key]
 
+    # Calculate unused filters: these are filters that are present in the input configuration
+    # but not referenced by any ESG since ESGs only reference contracts that need to be cloned
+    unusedFilterVrfDns = aggregateFilterVrfDns - migratedVrfDns
+    if unusedFilterVrfDns:
+        text = "There are VRFs included in the filter list that have not been migrated (tenant filters are converted into VRF filters).\n"
+        text += "The reason could be that there are no associated EPGs with contracts, "
+        text += "that the VRF does not have any vzAny contracts associated with it, or that "
+        text += "the EPGs have already been migrated.\nThe unused VRFs in the filter list are:\n"
+        text += "\t{}".format(", ".join(sorted(unusedFilterVrfDns)))
+        logger.info(text)
     #
     # Step 5: Write the report files and shows stats
     #
     if yamlOutputFile:
+        spinner.text = "Writing ESG analysis to YAML file"
         try:
             with open(yamlOutputFile, "w") as yamlFile:
-                spinner.text = "Writing ESG analysis to YAML file"
                 yamlFile.write("# YAML file generated via ESG Migration Assistant\n")
                 yamlFile.write("# Contract cloned using {} style\n".format("Nexus Dashboard" if ndCompliant else "ACI native"))
                 yaml.dump(jsonResult, yamlFile, sort_keys=False, default_flow_style=False)
@@ -2383,18 +2434,18 @@ def capacityCheck(node, fabricDescriptor, vrfConversionSet, noConfig):
     if numVrfConversionCritical > 0:
         if noConfig:
             logger.warning("Continue conversion since --noConfig option is used and no config is pushed to APIC.")
-            logger.warning("Conversion will run in a non-optimized mode since VRFs are deployed on nodes with high TCAM usage (usage >= 80%).")
+            logger.warning("Conversion will run in TCAM optimized mode since VRFs are deployed on nodes with high TCAM usage (usage >= 80%).")
         else:
             logger.critical("Aborting conversion. Please free up some TCAM usage or delete the VRF{} from the conversion YAML file."
                             .format("" if numVrfConversionCritical == 1 else "s"))
             sys.exit(1)
     elif numVrfConversionWarning > 0:
-        logger.warning("Conversion will run in a non-optimized mode since VRFs are deployed on nodes with warning TCAM usage (50% <= usage < 80%).")
-        logger.warning("This will conserve TCAM space but more traffic loss may be observed during migration.")
+        logger.warning("Conversion will run in TCAM optimized mode since VRFs are deployed on nodes with warning TCAM usage (50% <= usage < 80%).")
+        logger.warning("TCAM optimized mode will conserve TCAM space but more traffic loss may be observed during migration.")
         logger.warning("If you want to avoid this, please free up some TCAM space on the nodes or delete the VRFs from the conversion YAML file.")
     else:
         logger.info("All VRFs in the conversion YAML file are deployed on nodes with healthy TCAM usage (<50%).")
-        logger.info("Conversion will run in an optimized mode, this will ensure minimal traffic loss during migration.")
+        logger.info("Conversion will run in TCAM non-optimized mode, this will temporarily use more TCAM space but ensure minimal traffic loss during migration.")
 
     fabricDescriptor['nodeInfo'] = nodeInfo
     fabricDescriptor['nodeWarnings'] = nodeWarnings
@@ -2404,7 +2455,7 @@ def capacityCheck(node, fabricDescriptor, vrfConversionSet, noConfig):
     fabricDescriptor['numVrfConversionWarning'] = numVrfConversionWarning
     fabricDescriptor['numVrfConversionCritical'] = numVrfConversionCritical
 
-def preConversionHealthCheck(node, fabricDescriptor, esgToVrfMap):
+def validateGlobalPcTagCapacity(node, fabricDescriptor, esgToVrfMap):
     """
     Helper function to check pre-existing faults prior to running conversion.
     In case of catastrophic faults, False is returned, signaling conversion to abort.
@@ -2415,21 +2466,34 @@ def preConversionHealthCheck(node, fabricDescriptor, esgToVrfMap):
 
     # Global PC Tag check
     globalPcTagCount = 0
+    numEsgInYaml = len(esgToVrfMap)
+    numExistingEsgInYaml = 0
+    numTotalESgInFabric = 0
+    pcTagSet = set()
     # Formula: total fvEPg with pcTag < 16384 (16k) - fvEPgSelector with no configIssues
     params = {'query-target-filter': 'and(lt(fvEPg.pcTag,"16384"),ne(fvEPg.pcTag,"any"))'}
-    globalPcTagCount += len(node.methods.ResolveClass('fvEPg').GET(**params))
-
-    params = {'query-target-filter': 'and(eq(fvEPgSelector.configIssues,%22%22))'}
-    globalPcTagCount -= len(node.methods.ResolveClass('fvEPgSelector').GET(**params))
-
-    logger.info("Global PC Tag count in the fabric is {}".format(globalPcTagCount))
+    mos = callApiWithRetry(node, node.methods.ResolveClass('fvEPg').GET, **params)
+    for mo in mos:
+        if mo.ClassName == 'fvESg':
+            numTotalESgInFabric += 1
+            if mo.Dn in esgToVrfMap:
+                numExistingEsgInYaml += 1
+        pcTagSet.add(mo.pcTag)
+    globalPcTagCount += len(pcTagSet)
     fabricDescriptor['globalPcTagCount'] = globalPcTagCount
 
-    numEsgToConfigure = len(esgToVrfMap)
-    logger.info("The number of ESGs to configure is {}".format(numEsgToConfigure))
-    if globalPcTagCount + numEsgToConfigure > 10000:
+    numNewPcTagNeeded = numEsgInYaml - numExistingEsgInYaml
+    logger.info("The total Global PC Tag count in the fabric is {}".format(globalPcTagCount))
+    logger.info("The total number of Existing ESGs in the fabric is {}".format(numTotalESgInFabric))
+    logger.info("The total number of ESGs in YAML file is {}".format(numEsgInYaml))
+    logger.info("The total number of NEW ESGs to configure is {}".format(numNewPcTagNeeded))
+
+    if globalPcTagCount + numNewPcTagNeeded >= 16384:
         logger.critical("Not enough Global PC Tags available in the fabric to configure all ESGs")
-        logger.critical("Aborting conversion. Please free up some PC Tags or reduce the number of ESGs to configure")
+        return False
+
+    if  numTotalESgInFabric + numNewPcTagNeeded > 10000:
+        logger.critical("The total number of ESGs in the fabric after conversion will exceed 10000, which is the maximum number of ESGs supported in the fabric.")
         return False
 
     return True
@@ -3041,32 +3105,35 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         seg = 0
         epg = ""
         esgToNodeId = set()
-        epgToNodeToPcTag = {"executed": False}
+        epgToNodeToPcTag = {}
         def epgSelConditionFn():
             nodesNotUpdated = set()
+            nodesUpdated = set()
             oldPcTag = 0
-            if not epgToNodeToPcTag["executed"]:
-                spinner.text = "Collecting EPG selector configuration on nodes (vlanCktEp objects)"
-                concreteResult = callApiWithRetry(node, node.methods.ResolveClass('vlanCktEp').GET, **{})
-                epgToNodeToPcTag["executed"] = True
-                for vlanCktEpMo in concreteResult:
-                    epgToNodeToPcTag.setdefault(vlanCktEpMo.epgDn, {})[vlanCktEpMo.dn] = int(vlanCktEpMo.pcTag)
-
             if epg in epgToNodeToPcTag:
+                # Query only vlanCktEp entries that have not already updated the new pcTag to optimize the number of API calls to nodes
                 for vlanCktEpDn in epgToNodeToPcTag[epg]:
-                    nodeId = getNodeIdFromDn(vlanCktEpDn)
-                    esgToNodeId.add(nodeId)
                     if epgToNodeToPcTag[epg][vlanCktEpDn] != pcTag:
-                        nodesNotUpdated.add(nodeId)
+                        results = callApiWithRetry(node, node.mit.FromDn(vlanCktEpDn).GET, **{})
+                        if results and len(results) > 0:
+                            vlanCktEpMo = results[0]
+                            epgToNodeToPcTag[epg][vlanCktEpDn] = int(vlanCktEpMo.pcTag)
+
+                for vlanCktEpDn in epgToNodeToPcTag[epg]:
+                    if epgToNodeToPcTag[epg][vlanCktEpDn] != pcTag:
+                        nodesNotUpdated.add(getNodeIdFromDn(vlanCktEpDn))
                         oldPcTag = epgToNodeToPcTag[epg][vlanCktEpDn]
-                        epgToNodeToPcTag["executed"] = False  # Re-run the check on next iteration to get updated pcTag values
+                    else:
+                        nodesUpdated.add(getNodeIdFromDn(vlanCktEpDn))
             if not nodesNotUpdated:
-                logger.info("{} {} was updated on all nodes with PC Tag {}".format(epgDnToNameStr(epg), epg, pcTag))
+                logger.info("{} {} was updated on all nodes{}{}{} with PC Tag {}"
+                    .format(epgDnToNameStr(epg), epg, " (" if len(nodesUpdated) > 0 else "", ",".join(sorted(nodesUpdated)), ")" if len(nodesUpdated) > 0 else "", pcTag))
+                esgToNodeId.update(nodesUpdated)
             else:
                 logger.info("Waiting for {} {} on node{} {} to update with PC Tag {} (current {})"
                     .format(epgDnToNameStr(epg), epg, "s" if len(nodesNotUpdated) > 1 else "",
                             ",".join(sorted(nodesNotUpdated)), pcTag, oldPcTag))
-                spinner.text = "Collecting EPG selector configuration on nodes (vlanCktEp objects)"
+                spinner.text = "Waiting"
             return len(nodesNotUpdated) == 0
 
         def epgSelOnSuccess(_):
@@ -3109,6 +3176,11 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         def extSubSelOnSuccess(_):
             spinner.stop()
             print()
+
+        spinner.text = "Collecting EPGs/Vlans to node deployments (vlanCktEp objects)"
+        concreteResult = callApiWithRetry(node, node.methods.ResolveClass('vlanCktEp').GET, **{})
+        for vlanCktEpMo in concreteResult:
+            epgToNodeToPcTag.setdefault(vlanCktEpMo.epgDn, {})[vlanCktEpMo.dn] = int(vlanCktEpMo.pcTag)
 
         esgConfigs = {}
         instPSelectorsConfigPatch = node.mit.polUni()
@@ -3204,6 +3276,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                                 description = "EPG {} to be updated with PC Tag {} on all nodes".format(epg, pcTag),
                                 timeout = CONFIG_TIMEOUT,
                                 ih = InputHandler(),
+                                checkInterval = 2,
                                 onSuccess = epgSelOnSuccess)
                             if not result:
                                 selRc |= ReturnCode.CONFIG_TIMEOUT
@@ -3215,6 +3288,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                                     description = "actrlPfxEntry for {} to be updated with PC Tag {} on all nodes".format(subnet['ip'], pcTag),
                                     timeout = CONFIG_TIMEOUT,
                                     ih = InputHandler(),
+                                    checkInterval = 2,
                                     onSuccess = extSubSelOnSuccess)
                                 if not result:
                                     selRc |= ReturnCode.CONFIG_TIMEOUT
@@ -3237,7 +3311,8 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                                         conditionFn = epgSelConditionFn,
                                         description = "EPG {} to be updated with PC Tag {} on all nodes".format(epg, pcTag),
                                         timeout = CONFIG_TIMEOUT,
-                                        ih = InputHandler())
+                                        ih = InputHandler(),
+                                        checkInterval = 2)
                                     if not result:
                                         allRc |= ReturnCode.CONFIG_TIMEOUT
                             else:
@@ -3247,7 +3322,8 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                                             conditionFn = extSubSelConditionFn,
                                             description = "actrlPfxEntry for {} to be updated with PC Tag {} on all nodes".format(subnet['ip'], pcTag),
                                             timeout = CONFIG_TIMEOUT,
-                                            ih = InputHandler())
+                                            ih = InputHandler(),
+                                            checkInterval = 2)
                                         if not result:
                                             allRc |= ReturnCode.CONFIG_TIMEOUT
                         epgSelOnSuccess(None)
@@ -3625,7 +3701,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     #
     logger.info(colored("----------------------------------------------------------", bold=True))
     logger.info(colored("Configuration phase 2: {} Installation".format("Selectors" if tcamOptimizedMode else "Contract"), bold=True))
-    logger.info(colored("Optimized mode: {}".format("YES" if tcamOptimizedMode else "NO"), bold=True))
+    logger.info(colored("TCAM Optimized mode: {}".format("YES" if tcamOptimizedMode else "NO"), bold=True))
     logger.info(colored("----------------------------------------------------------", bold=True))
 
     if tcamOptimizedMode:
@@ -3655,7 +3731,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     #
     logger.info(colored("----------------------------------------------------------", bold=True))
     logger.info(colored("Configuration phase 3: {} Installation".format("Contract" if tcamOptimizedMode else "Selectors"), bold=True))
-    logger.info(colored("Optimized mode: {}".format("YES" if tcamOptimizedMode else "NO"), bold=True))
+    logger.info(colored("TCAM Optimized mode: {}".format("YES" if tcamOptimizedMode else "NO"), bold=True))
     logger.info(colored("----------------------------------------------------------", bold=True))
 
     if tcamOptimizedMode:
@@ -4316,11 +4392,12 @@ it may {} between the grouped EPGs.
 
     vrfdns = [item for item in args.vrfdns.split(',')] if args.vrfdns else []
     tenantdns = [item for item in args.tenantdns.split(',')] if args.tenantdns else []
+    tenantregexes = [item for item in args.tenantRegex.split(',')] if args.tenantRegex else []
     ndCompliant = '--disableNdMode' not in sys.argv
     showStats = '--showStats' in sys.argv
 
     relationFramework(mit)
-    generateDryrunConfig(mit, args.mode, ndCompliant, args.outYaml, args.prefix, args.suffix, vrfdns, tenantdns, showStats)
+    generateDryrunConfig(mit, args.mode, ndCompliant, args.outYaml, args.prefix, args.suffix, vrfdns, tenantdns, tenantregexes, showStats)
 
 def dryRunValidate(args, parser):
     if not args.fromApic:
@@ -4352,6 +4429,7 @@ def dryRunValidate(args, parser):
 
     vrfDns = args.vrfdns.split(',') if args.vrfdns else []
     tenantDns = args.tenantdns.split(',') if args.tenantdns else []
+    tenantRegexes = args.tenantRegex.split(',') if args.tenantRegex else []
 
     for vrfdn in vrfDns:
         if not isValidDn(vrfdn, ['uni', 'tn-', 'ctx-']):
@@ -4363,16 +4441,41 @@ def dryRunValidate(args, parser):
             parser.error("Invalid Tenant DN {}. The correct Tenant DN syntax is 'uni/tn-<tenant_name>'".format(tenantdn))
             sys.exit(1)
 
-    overlaps = []
+    for tenantRegex in tenantRegexes:
+        try:
+            tenantRegex = tenantRegex.strip()
+            if not tenantRegex:
+                parser.error("Invalid tenant regex '{}'. Regular expression cannot be empty. Please provide a valid regular expression.".format(tenantRegex))
+                sys.exit(1)
+            else:
+                re.compile(tenantRegex)
+        except re.error:
+            parser.error("Invalid tenant regex '{}'. Please provide a valid regular expression.".format(tenantRegex))
+            sys.exit(1)
+
+    parsedtenantRegexes = parseRegexFilters(tenantRegexes)
+
+    overlapTenantDns = []
+    overlapTenantRegexes = []
     for vrf in vrfDns:
         for tenant in tenantDns:
             if vrf.startswith(tenant):
-                overlaps.append((tenant, vrf))
-    if overlaps:
+                overlapTenantDns.append((tenant, vrf))
+        for i in range(len(parsedtenantRegexes)):
+            if re.match(parsedtenantRegexes[i], getTenantFromDn(vrf)):
+                overlapTenantRegexes.append((tenantRegexes[i], vrf))
+    if overlapTenantDns:
         text = "Ambiguous input: VRF DNs should not belong to any of the selected Tenant DNs."
-        text += "\nBoth --tenantdns and --vrfdns filters can be used together. When both are provided, the filters are combined using AND logic (not OR logic)."
-        for tenant, vrf in overlaps:
-            text += f"\n  - VRF {vrf} is inside tenant {tenant}"
+        text += "\n--tenantdns and --vrfdns filters can be used together. When both are provided, the filters are combined using UNION logic (not Intersection logic)."
+        for tenant, vrf in overlapTenantDns:
+            text += f"\n  - VRF {vrf} is inside Tenant {tenant}"
+        parser.error(text)
+        sys.exit(1)
+    if overlapTenantRegexes:
+        text = "Ambiguous input: VRF DNs should not belong to any of the selected Tenants via Regular Expressions."
+        text += "\n--tenantRegex and --vrfdns filters can be used together. When both are provided, the filters are combined using UNION logic (not Intersection logic)."
+        for tenantRegex, vrf in overlapTenantRegexes:
+            text += f"\n  - VRF {vrf} is inside Tenant Regular Expression {tenantRegex}"
         parser.error(text)
         sys.exit(1)
 
@@ -4411,12 +4514,17 @@ def dryRunParseDefine(childParser, **kwargs):
                               default='optimized')
     dryRunParser.add_argument('--tenantdns',
                               help='Filter the analysis to all VRFs within the specified Tenants. Provide a comma-separated list of Tenant DNs (no spaces). Example: uni/tn-T1,uni/tn-T2. '
-                                    'May be combined with --vrfdns; both filters apply using AND logic.',
+                                    'May be combined with other filters; all filters apply using UNION logic.',
                               type=str,
                               default="")
     dryRunParser.add_argument('--vrfdns',
                               help='Filter the analysis to the specified VRFs. Provide a comma-separated list of VRF DNs (no spaces). Example: uni/tn-T1/ctx-ctx1,uni/tn-T2/ctx-ctx2. '
-                                    'May be combined with --tenantdns; both filters apply using AND logic.',
+                                    'May be combined with other filters; all filters apply using UNION logic.',
+                              type=str,
+                              default="")
+    dryRunParser.add_argument('--tenantRegex',
+                              help='Filter by tenant name. Provide a comma-separated list of names or regex (no spaces). '
+                                   'Example: T1,T2,Prod.*,Test[0-9]+. May be combined with other filters; all filters apply using UNION logic.',
                               type=str,
                               default="")
     dryRunParser.add_argument('--outYaml',
@@ -4481,6 +4589,7 @@ The generated configuration can be saved in XML or JSON format using the --outpu
 
     esgDataFromYaml = []
     contractConversionDescriptor = ContractConversionDescriptor()
+    applyConfig = not args.noConfig
 
     try:
         spinner.text = f"Loading YAML file {args.inYaml}"
@@ -4523,18 +4632,22 @@ The generated configuration can be saved in XML or JSON format using the --outpu
 
     # Pre conversion health checks:
     # - Global PC Tag capacity
-    if not preConversionHealthCheck(node, fabricDescriptor, esgToVrfMap):
-        sys.exit(1)
+    if not validateGlobalPcTagCapacity(node, fabricDescriptor, esgToVrfMap):
+        if applyConfig:
+            logger.critical("Aborting conversion. Please free up some PC Tags or reduce the number of ESGs to configure")
+            sys.exit(1)
+        else:
+            logger.warning("Continue conversion since --noConfig option is used and no config is pushed to APIC.")
 
     transactions = configpushPending(node)
-    if transactions:
+    if transactions and applyConfig:
         logger.error("There {} {} pending transaction{}. Please wait for completion before running conversion phase."
                     .format("are" if transactions > 1 else "is", transactions, "s" if transactions > 1 else ""))
         sys.exit(1)
 
     # Create config snapshot before doing conversion
     snapshotName = TOOL_NAME_STR + "_Preconversion_Config"
-    if not args.noConfig:
+    if applyConfig:
         rc, _ = createCfgSnapshot(node, snapshotName)
         if rc not in [ReturnCode.SUCCESS, ReturnCode.USERSKIPPED]:
             logger.error("Config snapshot creation failed, aborting conversion")
@@ -4553,7 +4666,8 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     except KeyboardInterrupt:
         print("\n\n")
         logger.info("ESGMigrationAssistant conversion interrupted by user")
-        restoreConfigSnapshot(node, snapshotName)
+        if applyConfig:
+            restoreConfigSnapshot(node, snapshotName)
         sys.exit(0)
 
 def conversionValidate(args, parser):
@@ -4666,7 +4780,8 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     except KeyboardInterrupt:
         print("\n\n")
         logger.info("ESGMigrationAssistant cleanup interrupted by user")
-        restoreConfigSnapshot(node, snapshotName)
+        if not args.noConfig:
+            restoreConfigSnapshot(node, snapshotName)
         sys.exit(0)
 
 
@@ -4715,11 +4830,46 @@ def cleanupParseDefine(childParser, **kwargs):
 def defaultFuncHandle(args):
     print("No command invoked")
 
+tagRe = re.compile(r'</?[\w:-]+>')
+tagBeginningRe = re.compile(r'(</?[\w:-]+)(\s+)')
+tagEndRe = re.compile(r'([\"\s])(/?>)')
+propertyRe = re.compile(r'(\s[\w:-]+)(=)')
+stringRe = re.compile(r'"[^"]*"')
+commentRe = re.compile(r'<!--.*?-->', re.DOTALL)
+def fastXmlHighlight(text):
+    comments = []
+
+    def extract(m):
+        comments.append(m.group(0))
+        return f"__COMMENT_{len(comments)-1}__"
+
+    # remove comments temporarily
+    text = commentRe.sub(extract, text)
+
+    # highlight tags
+    text = tagRe.sub(lambda m: f"{BLUE}{m.group(0)}{RESET}", text)
+    text = tagBeginningRe.sub(lambda m: f"{BLUE}{m.group(1)}{RESET}{m.group(2)}", text)
+    text = tagEndRe.sub(lambda m: f"{m.group(1)}{BLUE}{m.group(2)}{RESET}", text)
+
+    # highlight property names
+    text = propertyRe.sub(lambda m: f"{CYAN}{m.group(1)}{RESET}{m.group(2)}", text)
+
+    # highlight property values
+    text = stringRe.sub(lambda m: f"{YELLOW}{m.group(0)}{RESET}", text)
+
+    # special highlight
+    text = re.sub(r'"deleted"', f"{BOLD_RED}\"deleted\"{RESET}", text)
+
+    # restore comments
+    for i, c in enumerate(comments):
+        colored = f"{GREY}{c}{RESET}"
+        text = text.replace(f"__COMMENT_{i}__", colored)
+
+    return text
 
 def xmlpost(self, message, *args, **kwargs):
     if self.isEnabledFor(XMLPOST_LEVEL_NUM):
-        message = '\n' + (highlight(message, XmlLexer(), TerminalFormatter()))
-        message = re.sub(r"\"deleted\"", f"{BOLD_RED}\"deleted\"{RESET}", message)
+        message = "\n" + fastXmlHighlight(message)
         self._log(XMLPOST_LEVEL_NUM, message, args, **kwargs)
 
 class ColorFormatter(logging.Formatter):
@@ -4737,6 +4887,12 @@ class ColorFormatter(logging.Formatter):
         record.levelname = f"{color}{record.levelname}:{RESET}"
         return super().format(record)
 
+ansiEscape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+class NoColorFormatter(logging.Formatter):
+    def format(self, record):
+        msg = super().format(record)
+        return ansiEscape.sub('', msg)
+
 class SpinnerStopHandler(logging.Handler):
     def emit(self, record):
         spinner.stop()
@@ -4751,11 +4907,8 @@ def main():
                         help='acimeta Location',
                         default="aci-meta.json")
     parser.add_argument('--fromApic',
-                        help='Running it from APIC, by default we assume is being launched outside',
+                        help=argparse.SUPPRESS,
                         action='store_true')
-    parser.add_argument('--logToFile',
-                        help='File to log to',
-                        default='ESGMigrationAssistant.log')
     parser.add_argument('--logLevel',
                         help='Level for logging info',
                         default='INFO',
@@ -4824,11 +4977,20 @@ def main():
     logger.addHandler(console_handler)
 
     # Configure file logging
-    if args.logToFile:
-        file_handler = logging.FileHandler(args.logToFile, mode="w")
-        file_handler.setLevel(log_level)
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logger.addHandler(file_handler)
+    logfilePrefix = ""
+    if args.handle == dryRunFuncHandle:
+        logfilePrefix = "_dryrun_"
+    elif args.handle == conversionFuncHandle:
+        logfilePrefix = "_conversion_"
+    elif args.handle == cleanupFuncHandle:
+        logfilePrefix = "_cleanup_"
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S") + f"_{int(now.microsecond / 1000):03d}"
+    file_handler = logging.FileHandler(f"ESGMigrationAssistant{logfilePrefix}{timestamp}.log", mode="w")
+    file_handler.setLevel(log_level)
+    formatter = NoColorFormatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
     logging.debug("Logging initialized.")
     logging.debug("Parsed arguments: {}".format(args))

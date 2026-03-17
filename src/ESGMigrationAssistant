@@ -44,9 +44,9 @@ if [[ ${runningFromAPIC} -eq 0 ]]; then
     if [[ ! -x ${pythonToInvoke} ]]; then
         prematureExit "Cannot find ${pythonCmd} anywhere, and i need it"
     fi
-    ${pythonToInvoke} ${rootdir}/ESGMigrationAssistant.py $@
+    ${pythonToInvoke} ${rootdir}/ESGMigrationAssistant.py "$@"
     exit $?
 fi
 cd ${rootdir}
-/opt/cisco/system-venv3/bin/python3 ${rootdir}/ESGMigrationAssistant.py --fromApic $@
+/opt/cisco/system-venv3/bin/python3 ${rootdir}/ESGMigrationAssistant.py --fromApic "$@"
 exit $?
