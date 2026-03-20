@@ -637,7 +637,7 @@ def callApiWithRetry(node, func, *args, **kwargs):
             if not retry:
                 raise
 
-def logAndPostHandler(outputElem, node, outputFile = None, noConfig = True, step = None, allowYesToAll = False):
+def logAndPostHandler(outputElem, node, noConfig = True, step = None, allowYesToAll = False):
     logger = logging.getLogger(globalValues['logger'])
 
     def xmlWithComment(mo):
@@ -719,17 +719,7 @@ def logAndPostHandler(outputElem, node, outputFile = None, noConfig = True, step
 
                 if result is None:
                     rc |= ReturnCode.CONFIG_TIMEOUT
-            if outputFile:
-                try:
-                    if outputFile.endswith(".xml"):
-                        with open(outputFile, "a") as f:
-                            f.write(outputElem.GetXml() + "\n")
-                    elif outputFile.endswith(".json"):
-                        with open(outputFile, "a") as f:
-                            f.write(outputElem.Json + "\n")
-                except Exception as fe:
-                    logger.error("Failed to write output config to file {} due to {}".format(outputFile, fe))
-                    rc |= ReturnCode.FILEWRITEFAILED
+
         except Exception as e:
             # Parse XML
             imdata = ET.fromstring(str(e))
@@ -872,7 +862,8 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 epgLayout[epg]['hasInheritedContracts'] = True
             inheritedFrom[epg].discard(masterEpg)
 
-    def addEsgGroupDebugInfo(esgJson, vrfDn, debugInfo):
+    def addEsgGroupDebugInfo(esgJson, vrfDn):
+        debugInfo = ""
         lenEpgSelectors = len(esgJson['epgs'])
         debugInfo += "Group of {} {}EPG{}".format(
             lenEpgSelectors, "similar "if lenEpgSelectors > 1 else "", "s"if lenEpgSelectors > 1 else "")
@@ -891,7 +882,8 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
             debugInfo += "\n      No contracts associated"
         return debugInfo
 
-    def addLeakRouteDebugInfo(fromtype, leakInternal, leakExternal, leakToVrfs, vrfDn, esgJson, debugInfo):
+    def addLeakRouteDebugInfo(fromtype, leakInternal, leakExternal, leakToVrfs, vrfDn, esgJson):
+        debugInfo = ""
         if leakToVrfs:
             if esgJson == None:
                 debugInfo += "Leak routes from VRF {}".format(vrfDn)
@@ -1308,6 +1300,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     # contract providers and consumers.
     #
     jsonResult = {'vrfs': [], 'contractClones': [], 'contractIfClones': []}
+    leakSubnetsFromTo = {}
     visitedEpgs = set()
     groupCount = 0
     contractDnToESGMapping = {}
@@ -1521,79 +1514,94 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 contractsReferences.add(contractDn)
 
         if epgSelectors or externalSubnetSelectors:
-            debugInfo = addEsgGroupDebugInfo(esgJson, vrfDn, debugInfo)
+            debugInfo += addEsgGroupDebugInfo(esgJson, vrfDn)
             for vrf in jsonResult['vrfs']:
                 if vrf['vrf'] == vrfDn:
                     vrf['esgs'].append(esgJson)
                     break
 
-        # Handle leak subnets and prefixes
-        # Populate leak subnets and prefixes at the VRF level
+        # Handle leak subnets and prefixes.
+        # Organize them in leakSubnetsFromTo dict which will be used in the next step to detect
+        # duplicates and populate the leak subnets and prefixes in the JSON result.
+        leakSubnetsFromTo.setdefault(vrfDn, {'internal': {}, 'external': {}})
         if (leakInternalSubnetsFromProv or leakExternalPrefixes) and leakToConsumerVrfs:
-            for vrf in jsonResult['vrfs']:
-                if vrf['vrf'] == vrfDn:
-                    for ip, scope in leakInternalSubnetsFromProv:
-                        found = False
-                        for entry in vrf['leakInternalSubnets']:
-                            if entry['ip'] == ip and entry['scope'] == scope:
-                                entry['leakTo'].update(leakToConsumerVrfs)
-                                found = True
-                                break
-                        if not found:
-                            vrf['leakInternalSubnets'].append({'ip': ip, 'scope':scope, 'leakTo': leakToConsumerVrfs})
-                    for prefix, aggregate in leakExternalPrefixes:
-                        found = False
-                        for entry in vrf['leakExternalPrefixes']:
-                            if entry['ip'] == prefix:
-                                entry['leakTo'].update(leakToConsumerVrfs)
-                                if aggregate == "shared-rtctrl":
-                                    entry['le'] = 32 if ipaddress.ip_network(prefix).version == 4 else 128
-                                found = True
-                                break
-                        if not found:
-                            le = 'unspecified'
-                            ge = 'unspecified'
-                            if aggregate == "shared-rtctrl":
-                                le = 32 if ipaddress.ip_network(prefix).version == 4 else 128
-                            vrf['leakExternalPrefixes'].append({'ip': prefix, 'le': le, 'ge': ge, 'leakTo': leakToConsumerVrfs})
-                    break
-            debugInfo = addLeakRouteDebugInfo("Provider", leakInternalSubnetsFromProv, leakExternalPrefixes, leakToConsumerVrfs, vrfDn, esgJson, debugInfo)
+            for leakTo in leakToConsumerVrfs:
+                leakSubnetsFromTo[vrfDn]['internal'].setdefault(leakTo, set())
+                leakSubnetsFromTo[vrfDn]['internal'][leakTo].update(leakInternalSubnetsFromProv)
+                leakSubnetsFromTo[vrfDn]['external'].setdefault(leakTo, set())
+                leakSubnetsFromTo[vrfDn]['external'][leakTo].update(leakExternalPrefixes)
+            debugInfo += addLeakRouteDebugInfo("Provider", leakInternalSubnetsFromProv, leakExternalPrefixes, leakToConsumerVrfs, vrfDn, esgJson)
 
         if (leakInternalSubnetsFromCons or leakExternalPrefixes) and leakToProviderVrfs:
-            for vrf in jsonResult['vrfs']:
-                if vrf['vrf'] == vrfDn:
-                    for ip, scope in leakInternalSubnetsFromCons:
-                        found = False
-                        for entry in vrf['leakInternalSubnets']:
-                            if entry['ip'] == ip and entry['scope'] == scope:
-                                entry['leakTo'].update(leakToProviderVrfs)
-                                found = True
-                                break
-                        if not found:
-                            vrf['leakInternalSubnets'].append({'ip': ip, 'scope':scope, 'leakTo': leakToProviderVrfs})
-                    for prefix, aggregate in leakExternalPrefixes:
-                        found = False
-                        for entry in vrf['leakExternalPrefixes']:
-                            if entry['ip'] == prefix:
-                                entry['leakTo'].update(leakToProviderVrfs)
-                                if aggregate == "shared-rtctrl":
-                                    entry['le'] = 32 if ipaddress.ip_network(prefix).version == 4 else 128
-                                found = True
-                                break
-                        if not found:
-                            le = 'unspecified'
-                            ge = 'unspecified'
-                            if aggregate == "shared-rtctrl":
-                                le = 32 if ipaddress.ip_network(prefix).version == 4 else 128
-                            vrf['leakExternalPrefixes'].append({'ip': prefix, 'le': le, 'ge': ge, 'leakTo': leakToProviderVrfs})
-                    break
-            debugInfo = addLeakRouteDebugInfo("Consumer", leakInternalSubnetsFromCons, leakExternalPrefixes, leakToProviderVrfs, vrfDn, esgJson, debugInfo)
+            for leakTo in leakToProviderVrfs:
+                leakSubnetsFromTo[vrfDn]['internal'].setdefault(leakTo, set())
+                leakSubnetsFromTo[vrfDn]['internal'][leakTo].update(leakInternalSubnetsFromCons)
+                leakSubnetsFromTo[vrfDn]['external'].setdefault(leakTo, set())
+                leakSubnetsFromTo[vrfDn]['external'][leakTo].update(leakExternalPrefixes)
+            debugInfo += addLeakRouteDebugInfo("Consumer", leakInternalSubnetsFromCons, leakExternalPrefixes, leakToProviderVrfs, vrfDn, esgJson)
 
         if debugInfo:
             logger.info(debugInfo)
 
-    # Sort the leak subnets and prefixes and the contract clones for consistent output
-    # Get the list of contracts references
+    # End of main loop iterating over EPGs
+
+    #
+    # Step 5: Populate leak subnets and prefixes in the JSON result and remove duplicates.
+    # Sort all the lists for consistent output
+    # Cleanup unused fields
+    #
+
+    def reduceSubnets(subnetSet):
+        # Sort the subnets by prefix length (smallest to largest) and then iterate over the sorted list
+        # to remove subnets that are included in other subnets. This is needed to avoid having duplicated
+        # leak routes in ESG when multiple EPGs are leaking overlapping subnets.
+        networks = [(ipaddress.ip_network(subnet), scope) for subnet, scope in subnetSet]
+        networks.sort(key=lambda x: x[0].prefixlen)
+
+        networkFinal = []
+        for ip, scope in networks:
+            largerPresent = False
+            for existingIp, _ in networkFinal:
+                if ip.subnet_of(existingIp):
+                    largerPresent = True
+                    break
+            if not largerPresent:
+                networkFinal.append((ip, scope))
+        return set((str(ip), scope) for ip, scope in networkFinal)
+
+    for fromVrf, targets in leakSubnetsFromTo.items():
+        for vrf in jsonResult['vrfs']:
+            if vrf['vrf'] == fromVrf:
+                for toVrf, subnetSet in targets['internal'].items():
+                    for ip, scope in reduceSubnets(subnetSet):
+                        found = False
+                        for entry in vrf['leakInternalSubnets']:
+                            if entry['ip'] == ip and entry['scope'] == scope:
+                                entry['leakTo'].add(toVrf)
+                                found = True
+                                break
+                        if not found:
+                            vrf['leakInternalSubnets'].append({'ip': ip, 'scope':scope, 'leakTo': {toVrf}})
+
+                for toVrf, subnetSet in targets['external'].items():
+                    for prefix, aggregate in subnetSet:
+                        found = False
+                        for entry in vrf['leakExternalPrefixes']:
+                            if entry['ip'] == prefix:
+                                entry['leakTo'].add(toVrf)
+                                if aggregate == "shared-rtctrl":
+                                    entry['le'] = 32 if ipaddress.ip_network(prefix).version == 4 else 128
+                                found = True
+                                break
+                        if not found:
+                            le = 'unspecified'
+                            ge = 'unspecified'
+                            if aggregate == "shared-rtctrl":
+                                le = 32 if ipaddress.ip_network(prefix).version == 4 else 128
+                            vrf['leakExternalPrefixes'].append({'ip': prefix, 'le': le, 'ge': ge, 'leakTo': {toVrf}})
+                break
+
+    # Sort all the lists for consistent output
     # Cleanup unused fields
     migratedVrfDns = set()
     for vrf in jsonResult['vrfs']:
@@ -1723,7 +1731,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
         text += "\t{}".format(", ".join(sorted(unusedFilterVrfDns)))
         logger.info(text)
     #
-    # Step 5: Write the report files and shows stats
+    # Step 6: Write the report files and shows stats
     #
     if yamlOutputFile:
         spinner.text = "Writing ESG analysis to YAML file"
@@ -1957,16 +1965,19 @@ def validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap):
     logger = logging.getLogger(globalValues['logger'])
     spinner.text = "Validating existing ESG to VRF mapping"
 
-    vrfConfigured = set()
+    vrfConfigured = {}
+    vrfToEsgValidationFailure = False
     result = callApiWithRetry(node, node.methods.ResolveClass('fvCtx').GET, **{})
     for mo in result:
-        vrfConfigured.add(mo.dn)
+        vrfConfigured[mo.dn] = 0
 
     # Validate that all VRFs mapped to ESGs exist
     for esgDn, (vrfDn, esg_line) in esgToVrfMap.items():
         if vrfDn not in vrfConfigured:
             logger.error("ESG {} (line {}) on YAML file is mapped to VRF {} which does not exist on APIC".format(getNameFromDn(esgDn), esg_line, vrfDn))
-            return ReturnCode.VALIDATION_FAILED
+            vrfToEsgValidationFailure = True
+        else:
+            vrfConfigured[vrfDn] += 1
 
     # Get all the fvRsScope. Each fvRsScope is created for each ESG and points to the VRF.
     result = callApiWithRetry(node, node.methods.ResolveClass('fvRsScope').GET, **{})
@@ -1977,12 +1988,18 @@ def validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap):
                 expectedVrfDn, esg_line = esgToVrfMap[esgDn]
                 if mo.tDn != expectedVrfDn:
                     logger.error("ESG {} (line {}) on YAML file is mapped to VRF {} but the same ESG on APIC is mapped to VRF {}".format(getNameFromDn(esgDn), esg_line, expectedVrfDn, mo.tDn))
-                    return ReturnCode.VALIDATION_FAILED
+                    vrfToEsgValidationFailure = True
             else:
                 if mo.tDn in vrfsInYaml["conversion"] or mo.tDn in vrfsInYaml["leakTo"]:
                     perVrfPreExistingEsgMap.setdefault(mo.tDn, set()).add(esgDn)
+                vrfConfigured[mo.tDn] += 1
 
-    return ReturnCode.SUCCESS
+    for vrfDn, count in vrfConfigured.items():
+        if count > 4000:
+            logger.error("After migration, VRF {} will have {} ESGs mapped to it. This will exceed the recommended limit and may cause performance issues.".format(vrfDn, count))
+            vrfToEsgValidationFailure = True
+
+    return ReturnCode.VALIDATION_FAILED if vrfToEsgValidationFailure else ReturnCode.SUCCESS
 
 def validateAndCloneContracts(node, esgDataFromYaml, contractConversionDescriptor):
     """
@@ -2644,7 +2661,7 @@ def createCfgSnapshot(node, snapshotName):
                             adminSt="triggered",
                             descr="Snapshot taken by ESG Migration Assistant tool")
     logger.info("Creating config snapshot job")
-    rc = logAndPostHandler(exportCfg, node, outputFile = None, noConfig = False)
+    rc = logAndPostHandler(exportCfg, node, noConfig = False)
 
     if rc == ReturnCode.SUCCESS:
         logger.info("Snapshot creation job posted successfully")
@@ -2708,7 +2725,7 @@ def restoreCfgSnapshot(node, fileName):
                             importType="replace",
                             importMode="atomic")
     logger.info("Creating Rollback config job using snapshot file {}".format(fileName))
-    rc = logAndPostHandler(inportCfg, node, outputFile = None, noConfig = False)
+    rc = logAndPostHandler(inportCfg, node, noConfig = False)
 
     if rc == ReturnCode.SUCCESS:
         logger.info("Rollback job posted successfully")
@@ -2833,10 +2850,12 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     vrfToSeg = {} # Map of VRF to Segment ID
     esgToPcTag = {} # Map of ESG to PC Tag
     preExistingEsgNewContractMap = {}
+    globalConfigOutputFile = node.mit.polUni()
 
     steps = {'vrfs': {'current': 1, 'total': len(esgDataForXml['vrfs'])},
              'contractClones': {'current': 1, 'total': len(esgDataForXml['contractClones'])}}
 
+    # Erase output file if it already exists
     try:
         with open(outputFile, "w") as _:
             pass
@@ -2845,7 +2864,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         sys.exit(1)
 
     def logAndPost(outputElem, step = "", allowYesToAll = True):
-        return logAndPostHandler(outputElem, node, outputFile = outputFile, noConfig = noConfig, step = step, allowYesToAll = allowYesToAll)
+        return logAndPostHandler(outputElem, node, noConfig = noConfig, step = step, allowYesToAll = allowYesToAll)
 
     def createEsgAndLeakRouteForVrf(vrfData, leakRoute):
         vrfDn = vrfData['vrf']
@@ -2856,7 +2875,8 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         vrfTennantName = getTenantFromDn(vrfDn)
 
         perVrfConfig = node.mit.polUni()
-        perVrfConfig.fvTenant(vrfTennantName).fvCtx(vrfName)
+        for config in [perVrfConfig, globalConfigOutputFile]:
+            config.fvTenant(vrfTennantName).fvCtx(vrfName)
         mode = "immediate"
 
         for esg in sorted(esgList, key=lambda x: x['name']):
@@ -2868,9 +2888,10 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
             # else place the ESG in the VRF tenant
             tenantName = getTenantFromDn(esg['epgs'][0]) if esg['epgs'] else getTenantFromDn(vrf['vrf'])
 
-            perVrfConfig.fvTenant(tenantName).fvAp(appProfileName)\
-                .fvESg(name = esgName, instrImedcy=mode, pcEnfPref = esgPcEnfPref, prefGrMemb = esgPrefGrMemb)\
-                .fvRsScope(tnFvCtxName=vrfName)
+            for config in [perVrfConfig, globalConfigOutputFile]:
+                config.fvTenant(tenantName).fvAp(appProfileName)\
+                    .fvESg(name = esgName, instrImedcy=mode, pcEnfPref = esgPcEnfPref, prefGrMemb = esgPrefGrMemb)\
+                    .fvRsScope(tnFvCtxName=vrfName)
 
         # Create internal subnet leakroutes
         for leakInternalSubnet in leakInternalSubnets:
@@ -2881,20 +2902,22 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                         preExisting = True
                         break
                 if not preExisting:
-                    perVrfConfig.fvTenant(vrfTennantName).fvCtx(vrfName).leakRoutes()\
-                        .leakInternalSubnet(ip = leakInternalSubnet['ip'], scope = leakInternalSubnet['scope'])\
-                        .leakTo(ctxName=getNameFromDn(leakToVrf), tenantName=getTenantFromDn(leakToVrf), scope="inherit")
+                    for config in [perVrfConfig, globalConfigOutputFile]:
+                        config.fvTenant(vrfTennantName).fvCtx(vrfName).leakRoutes()\
+                            .leakInternalSubnet(ip = leakInternalSubnet['ip'], scope = leakInternalSubnet['scope'])\
+                            .leakTo(ctxName=getNameFromDn(leakToVrf), tenantName=getTenantFromDn(leakToVrf), scope="inherit")
 
         # Create external prefix leakroutes
         for leakExternalPrefix in leakExternalPrefixes:
-            extPrefMo = perVrfConfig.fvTenant(vrfTennantName).fvCtx(vrfName).leakRoutes()\
-                                    .leakExternalPrefix(ip = leakExternalPrefix['ip'])
-            if 'le' in leakExternalPrefix:
-                extPrefMo.le = str(leakExternalPrefix['le'])
-            if 'ge' in leakExternalPrefix:
-                extPrefMo.ge = str(leakExternalPrefix['ge'])
-            for leakVrf in leakExternalPrefix['leakTo']:
-                extPrefMo.leakTo(ctxName=getNameFromDn(leakVrf), tenantName=getTenantFromDn(leakVrf))
+            for config in [perVrfConfig, globalConfigOutputFile]:
+                extPrefMo = config.fvTenant(vrfTennantName).fvCtx(vrfName).leakRoutes()\
+                                  .leakExternalPrefix(ip = leakExternalPrefix['ip'])
+                if 'le' in leakExternalPrefix:
+                    extPrefMo.le = str(leakExternalPrefix['le'])
+                if 'ge' in leakExternalPrefix:
+                    extPrefMo.ge = str(leakExternalPrefix['ge'])
+                for leakVrf in leakExternalPrefix['leakTo']:
+                    extPrefMo.leakTo(ctxName=getNameFromDn(leakVrf), tenantName=getTenantFromDn(leakVrf))
 
         logger.info("Generated XML config for VRF {} in Tenant {} with new ESGs and route leaks. No contracts and selectors attached yet".format(colored(vrfName), colored(vrfTennantName)))
         vrfRc = logAndPost(perVrfConfig, step = steps['vrfs'])
@@ -2914,13 +2937,15 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
             tenantName = getTenantFromDn(contract.Dn)
             if tenantName not in perTenantConfigToPost:
                 perTenantConfigToPost[tenantName] = node.mit.polUni()
-                perTenantConfigToPost[tenantName].fvTenant(tenantName)
-            uniJson = json.loads(perTenantConfigToPost[tenantName].Json)
-            for child in uniJson["polUni"]["children"]:
-                tenant = child.get("fvTenant")
-                tenant.setdefault("children", [])
-                tenant["children"].append(json.loads(contract.Json))
-                perTenantConfigToPost[tenantName].Json = json.dumps(uniJson)
+
+            for config in [perTenantConfigToPost[tenantName], globalConfigOutputFile]:
+                config.fvTenant(tenantName)
+                uniJson = json.loads(config.Json)
+                for child in uniJson["polUni"]["children"]:
+                    tenant = child.get("fvTenant")
+                    if tenant and tenant.get("attributes", {}).get("name") == tenantName:
+                        tenant.setdefault("children", []).append(json.loads(contract.Json))
+                        config.Json = json.dumps(uniJson)
 
         rc = ReturnCode.SUCCESS
         perTenantConfigToPost = {}
@@ -2973,23 +2998,23 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 perEsgConfig = node.mit.polUni()
                 for contract in esg.get('prov', []):
                     for newContract in contractConversionDescriptor.getByProvider(contract, esgDn):
-                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             config.fvTenant(tenantName).fvAp(apName) .fvESg(name=esgName)\
                                 .fvRsProv(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
                 for contract in esg.get('cons', []):
                     for newContract in contractConversionDescriptor.getByConsumer(contract, esgDn):
-                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             config.fvTenant(tenantName).fvAp(apName).fvESg(name=esgName)\
                                 .fvRsCons(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
                 for contract in esg.get('intraepg', []):
                     for newContract in contractConversionDescriptor.getByIntraEPG(contract, esgDn):
-                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             config.fvTenant(tenantName).fvAp(apName).fvESg(name=esgName)\
                                 .fvRsIntraEpg(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
                 for consIf in esg.get('consif', []):
                     for newContract in contractConversionDescriptor.getByConsumerIf(consIf, esgDn):
                         contractIfName = getNameFromDn(newContract['newContractDn'])
-                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             # Create Contract Interface
                             config.fvTenant(tenantName).vzCPIf(contractIfName).vzRsIf(tDn=newContract['newExportedFromDn'])
                             # Attach Consumed Contract Interface to ESG
@@ -3011,7 +3036,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 perEsgConfig = node.mit.polUni()
                 for contract in preExistingEsgNewContractMap[vrfDn][esgDn].get('prov', []):
                     for newContract in contractConversionDescriptor.getByProvider(contract, esgDn):
-                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             config.fvTenant(tenantName).fvAp(apName) .fvESg(name=esgName)\
                                 .fvRsProv(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
                             config.fvTenant(tenantName).fvAp(apName).fvESg(name=esgName)\
@@ -3022,7 +3047,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                             tagAnnConfig.xmlcomment = "tagAnnotation used to mark ESG fvRsProv for ESG migration cleanup"
                 for contract in preExistingEsgNewContractMap[vrfDn][esgDn].get('cons', []):
                     for newContract in contractConversionDescriptor.getByConsumer(contract, esgDn):
-                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             config.fvTenant(tenantName).fvAp(apName).fvESg(name=esgName)\
                                 .fvRsCons(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
                             config.fvTenant(tenantName).fvAp(apName).fvESg(name=esgName)\
@@ -3034,7 +3059,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 for contract in preExistingEsgNewContractMap[vrfDn][esgDn].get('consif', []):
                     for newContract in contractConversionDescriptor.getByConsumerIf(contract, esgDn):
                         contractIfName = getNameFromDn(newContract['newContractDn'])
-                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             # Create Contract Interface
                             config.fvTenant(tenantName).vzCPIf(contractIfName).vzRsIf(tDn=newContract['newExportedFromDn'])
                             tagAnnConfig = config.fvTenant(tenantName).vzCPIf(contractIfName).vzRsIf(tDn=contract)\
@@ -3048,18 +3073,18 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
                 for contract in preExistingEsgNewContractMap[vrfDn][esgDn].get('epgprov', []):
                     for newContract in contractConversionDescriptor.getByProvider(contract, esgDn):
-                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             config.fvTenant(tenantName).fvAp(apName) .fvESg(name=esgName)\
                                 .fvRsProv(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
                 for contract in preExistingEsgNewContractMap[vrfDn][esgDn].get('epgcons', []):
                     for newContract in contractConversionDescriptor.getByConsumer(contract, esgDn):
-                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             config.fvTenant(tenantName).fvAp(apName).fvESg(name=esgName)\
                                 .fvRsCons(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
                 for contract in preExistingEsgNewContractMap[vrfDn][esgDn].get('epgconsif', []):
                     for newContract in contractConversionDescriptor.getByConsumerIf(contract, esgDn):
                         contractIfName = getNameFromDn(newContract['newContractDn'])
-                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEsgConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             # Create Contract Interface
                             config.fvTenant(tenantName).vzCPIf(contractIfName).vzRsIf(tDn=newContract['newExportedFromDn'])
                             # Attach Consumed Contract Interface to ESG
@@ -3210,7 +3235,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
                     elif isValidDn(epg, ['uni', 'tn-', 'ap-', 'epg-']):
                         perEpgSelectorConfig = node.mit.polUni()
-                        for config in [perEpgSelectorConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perEpgSelectorConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             tagAnnConfig = config.fvTenant(tenantName).fvAp(apName)\
                                         .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg)\
                                         .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
@@ -3226,7 +3251,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 if externalSubnets:
                     perExtSubSelectorConfig = node.mit.polUni()
                     for subnet in externalSubnets:
-                        for config in [perExtSubSelectorConfig, esgConfigs[vrfDn]['vrf']]:
+                        for config in [perExtSubSelectorConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
                             tagAnnConfig = config.fvTenant(tenantName).fvAp(apName)\
                                         .fvESg(name=esgName)\
                                         .fvExternalSubnetSelector(ip=subnet['ip'], shared="yes" if subnet['scope'] == 'public' else "no")\
@@ -3346,6 +3371,16 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         """
         rc = ReturnCode.SUCCESS
 
+        def appendPbrToGlobalConfig(pbrCtxSubtree):
+            tenantName = getTenantFromDn(pbrCtxSubtree.Dn)
+            globalConfigOutputFile.fvTenant(tenantName)
+            uniJson = json.loads(globalConfigOutputFile.Json)
+            for child in uniJson["polUni"]["children"]:
+                tenant = child.get("fvTenant")
+                if tenant and tenant.get("attributes", {}).get("name") == tenantName:
+                    tenant.setdefault("children", []).append(json.loads(pbrCtxSubtree.Json))
+                    globalConfigOutputFile.Json = json.dumps(uniJson)
+
         spinner.text = "Analyze/Create PBR Logical Device Context for ESGs in scope of conversion"
         configToPost = []
         vnsLDevCtxMos = callApiWithRetry(node, node.methods.ResolveClass('vnsLDevCtx').GET, **{})
@@ -3365,6 +3400,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                     logger.error("Could not clone {} to {}".format(vnsLDevCtxMo.dn, targetDn))
                     continue
                 configToPost.append((vnsLDevCtxMo.dn, newPbrCtxSubtree))
+                appendPbrToGlobalConfig(newPbrCtxSubtree)
         step = {'current': 1, 'total': len(configToPost)}
         for dn, config in configToPost:
             logger.info("Posting cloned PBR Logical Device Context subtree {}".format(colored(dn)))
@@ -3384,7 +3420,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 if esgMo.pcTag != "any":
                     esgToPcTag[esgDn] = int(esgMo.pcTag)
                 if esgMo.shutdown == "yes":
-                    logger.info(f"Pre-existing ESG {esgDn} is shutdown, skipping contract relation extraction")
+                    logger.debug(f"Pre-existing ESG {esgDn} is shutdown, skipping contract relation extraction")
                     continue
                 for child in esgMo.Children:
                     if child.ClassName == "fvRsProv":
@@ -3406,9 +3442,11 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                                 preExistingEsgNewContractMap.setdefault(vrf, {})\
                                     .setdefault(esgDn, {}).setdefault('consif', set()).add(contractIfDn)
                     elif child.ClassName == "fvEPgSelector":
+                        if child.configIssues:
+                            continue
                         epgSourceSubtree = callApiWithRetry(node, node.mit.FromDn(child.matchEpgDn).GET, **{'rsp-subtree': 'children', 'rsp-prop-include': 'all'})
                         if not epgSourceSubtree or len(epgSourceSubtree) == 0:
-                            logger.error(f"Unable to retreive information related to pre-existing ESG {esgDn}")
+                            logger.error(f"Unable to retreive information related to EPG {child.matchEpgDn} associated to pre-existing ESG {esgDn}")
                             continue
                         epgMo = epgSourceSubtree[0]
                         for child in epgMo.Children:
@@ -3471,26 +3509,28 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                     if not contractDn:
                         continue
                     for newContract in contractConversionDescriptor.getByProvider(contractDn, inbMo.dn):
-                        perContractConfig.fvTenant(tenantName).mgmtMgmtP(mgmtPName)\
-                                .mgmtInB(inbName).fvRsProv(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
-                        tagAnnConfig = perContractConfig.fvTenant(tenantName)\
-                                        .mgmtMgmtP(mgmtPName).mgmtInB(inbName)\
-                                        .fvRsProv(tnVzBrCPName=getNameFromDn(contractDn))\
-                                        .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
-                        tagAnnConfig.xmlcomment = "tagAnnotation used to mark InB fvRsProv for ESG migration cleanup"
+                        for config in [perContractConfig, globalConfigOutputFile]:
+                            config.fvTenant(tenantName).mgmtMgmtP(mgmtPName)\
+                                  .mgmtInB(inbName).fvRsProv(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
+                            tagAnnConfig = config.fvTenant(tenantName)\
+                                            .mgmtMgmtP(mgmtPName).mgmtInB(inbName)\
+                                            .fvRsProv(tnVzBrCPName=getNameFromDn(contractDn))\
+                                            .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                            tagAnnConfig.xmlcomment = "tagAnnotation used to mark InB fvRsProv for ESG migration cleanup"
                         numContracts += 1
                 elif child.ClassName == "fvRsCons":
                     contractDn = child.tDn
                     if not contractDn:
                         continue
                     for newContract in contractConversionDescriptor.getByConsumer(contractDn, inbMo.dn):
-                        perContractConfig.fvTenant(tenantName).mgmtMgmtP(mgmtPName)\
-                                .mgmtInB(inbName).fvRsCons(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
-                        tagAnnConfig = perContractConfig.fvTenant(tenantName)\
-                                        .mgmtMgmtP(mgmtPName).mgmtInB(inbName)\
-                                        .fvRsCons(tnVzBrCPName=getNameFromDn(contractDn))\
-                                        .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
-                        tagAnnConfig.xmlcomment = "tagAnnotation used to mark InB fvRsCons for ESG migration cleanup"
+                        for config in [perContractConfig, globalConfigOutputFile]:
+                            config.fvTenant(tenantName).mgmtMgmtP(mgmtPName)\
+                                  .mgmtInB(inbName).fvRsCons(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
+                            tagAnnConfig = config.fvTenant(tenantName)\
+                                            .mgmtMgmtP(mgmtPName).mgmtInB(inbName)\
+                                            .fvRsCons(tnVzBrCPName=getNameFromDn(contractDn))\
+                                            .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                            tagAnnConfig.xmlcomment = "tagAnnotation used to mark InB fvRsCons for ESG migration cleanup"
                         numContracts += 1
                 elif child.ClassName == "fvRsConsIf":
                     contractIfDn = child.tDn
@@ -3498,16 +3538,17 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                         continue
                     for newContract in contractConversionDescriptor.getByConsumerIf(contractIfDn, inbMo.dn):
                         contractIfName = getNameFromDn(newContract['newContractDn'])
-                        # Create contract interface
-                        perContractConfig.fvTenant(tenantName).vzCPIf(contractIfName).vzRsIf(tDn=newContract['newExportedFromDn'])
-                        # Attach Consumed Contract Interface to Inband EPG
-                        perContractConfig.fvTenant(tenantName).mgmtMgmtP(mgmtPName)\
-                                .mgmtInB(inbName).fvRsConsIf(tnVzCPIfName=contractIfName)
-                        tagAnnConfig = perContractConfig.fvTenant(tenantName)\
-                                        .mgmtMgmtP(mgmtPName).mgmtInB(inbName)\
-                                        .fvRsConsIf(tnVzCPIfName=getNameFromDn(contractIfDn))\
-                                        .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
-                        tagAnnConfig.xmlcomment = "tagAnnotation used to mark InB fvRsConsIf for ESG migration cleanup"
+                        for config in [perContractConfig, globalConfigOutputFile]:
+                            # Create contract interface
+                            config.fvTenant(tenantName).vzCPIf(contractIfName).vzRsIf(tDn=newContract['newExportedFromDn'])
+                            # Attach Consumed Contract Interface to Inband EPG
+                            config.fvTenant(tenantName).mgmtMgmtP(mgmtPName)\
+                                    .mgmtInB(inbName).fvRsConsIf(tnVzCPIfName=contractIfName)
+                            tagAnnConfig = perContractConfig.fvTenant(tenantName)\
+                                            .mgmtMgmtP(mgmtPName).mgmtInB(inbName)\
+                                            .fvRsConsIf(tnVzCPIfName=getNameFromDn(contractIfDn))\
+                                            .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                            tagAnnConfig.xmlcomment = "tagAnnotation used to mark InB fvRsConsIf for ESG migration cleanup"
                         numContracts += 1
             if numContracts > 0:
                 configToPost.append((inbMo.dn, perContractConfig))
@@ -3541,26 +3582,28 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                     if not contractDn:
                         continue
                     for newContract in contractConversionDescriptor.getByProvider(contractDn, vzAnyMo.dn):
-                        perContractConfig.fvTenant(tenantName).fvCtx(vrfName)\
-                                .vzAny().vzRsAnyToProv(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
-                        tagAnnConfig = perContractConfig.fvTenant(tenantName)\
-                                        .fvCtx(vrfName).vzAny()\
-                                        .vzRsAnyToProv(tnVzBrCPName=getNameFromDn(contractDn))\
-                                        .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
-                        tagAnnConfig.xmlcomment = "tagAnnotation used to mark vzAny vzRsAnyToProv for ESG migration cleanup"
+                        for config in [perContractConfig, globalConfigOutputFile]:
+                            config.fvTenant(tenantName).fvCtx(vrfName)\
+                                  .vzAny().vzRsAnyToProv(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
+                            tagAnnConfig = config.fvTenant(tenantName)\
+                                            .fvCtx(vrfName).vzAny()\
+                                            .vzRsAnyToProv(tnVzBrCPName=getNameFromDn(contractDn))\
+                                            .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                            tagAnnConfig.xmlcomment = "tagAnnotation used to mark vzAny vzRsAnyToProv for ESG migration cleanup"
                         numContracts += 1
                 elif child.ClassName == "vzRsAnyToCons":
                     contractDn = child.tDn
                     if not contractDn:
                         continue
                     for newContract in contractConversionDescriptor.getByConsumer(contractDn, vzAnyMo.dn):
-                        perContractConfig.fvTenant(tenantName).fvCtx(vrfName)\
-                                .vzAny().vzRsAnyToCons(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
-                        tagAnnConfig = perContractConfig.fvTenant(tenantName)\
-                                        .fvCtx(vrfName).vzAny()\
-                                        .vzRsAnyToCons(tnVzBrCPName=getNameFromDn(contractDn))\
-                                        .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
-                        tagAnnConfig.xmlcomment = "tagAnnotation used to mark vzAny vzRsAnyToCons for ESG migration cleanup"
+                        for config in [perContractConfig, globalConfigOutputFile]:
+                            config.fvTenant(tenantName).fvCtx(vrfName)\
+                                  .vzAny().vzRsAnyToCons(tnVzBrCPName=getNameFromDn(newContract['newContractDn']))
+                            tagAnnConfig = config.fvTenant(tenantName)\
+                                            .fvCtx(vrfName).vzAny()\
+                                            .vzRsAnyToCons(tnVzBrCPName=getNameFromDn(contractDn))\
+                                            .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                            tagAnnConfig.xmlcomment = "tagAnnotation used to mark vzAny vzRsAnyToCons for ESG migration cleanup"
                         numContracts += 1
                 elif child.ClassName == "vzRsAnyToConsIf":
                     contractIfDn = child.tDn
@@ -3568,21 +3611,23 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                         continue
                     for newContract in contractConversionDescriptor.getByConsumerIf(contractIfDn, vzAnyMo.dn):
                         contractIfName = getNameFromDn(newContract['newContractDn'])
-                        # Create contract interface
-                        perContractConfig.fvTenant(tenantName).vzCPIf(contractIfName).vzRsIf(tDn=newContract['newExportedFromDn'])
-                        # Attach Consumed Contract Interface to Inband EPG
-                        perContractConfig.fvTenant(tenantName).fvCtx(vrfName)\
-                                    .vzAny().vzRsAnyToConsIf(tnVzCPIfName=contractIfName)
-                        tagAnnConfig = perContractConfig.fvTenant(tenantName)\
-                                            .fvCtx(vrfName).vzAny()\
-                                            .vzRsAnyToConsIf(tnVzCPIfName=getNameFromDn(contractIfDn))\
-                                            .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
-                        tagAnnConfig.xmlcomment = "tagAnnotation used to mark vzAny vzRsAnyToConsIf for ESG migration cleanup"
+                        for config in [perContractConfig, globalConfigOutputFile]:
+                            # Create contract interface
+                            config.fvTenant(tenantName).vzCPIf(contractIfName).vzRsIf(tDn=newContract['newExportedFromDn'])
+                            # Attach Consumed Contract Interface to Inband EPG
+                            config.fvTenant(tenantName).fvCtx(vrfName)\
+                                        .vzAny().vzRsAnyToConsIf(tnVzCPIfName=contractIfName)
+                            tagAnnConfig = config.fvTenant(tenantName)\
+                                                .fvCtx(vrfName).vzAny()\
+                                                .vzRsAnyToConsIf(tnVzCPIfName=getNameFromDn(contractIfDn))\
+                                                .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                            tagAnnConfig.xmlcomment = "tagAnnotation used to mark vzAny vzRsAnyToConsIf for ESG migration cleanup"
                         numContracts += 1
 
             if numContracts > 0:
                 # Add tag to vzAny for faster lookup during cleanup
-                perContractConfig.fvTenant(tenantName).fvCtx(vrfName).vzAny()\
+                for config in [perContractConfig, globalConfigOutputFile]:
+                    config.fvTenant(tenantName).fvCtx(vrfName).vzAny()\
                         .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
                 configToPost.append((vzAnyMo.dn, perContractConfig))
 
@@ -3756,9 +3801,19 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     if applyConfig:
         tcamCapacityCheck(node, fabricDescriptor['nodeInfo'])
 
+    try:
+        with open(outputFile, "w") as f:
+            if outputFile.endswith(".xml"):
+                f.write(globalConfigOutputFile.GetXml())
+            elif outputFile.endswith(".json"):
+                f.write(globalConfigOutputFile.Json)
+    except Exception as fe:
+        logger.error("Failed to write output config to file {} due to {}".format(outputFile, fe))
+
     logger.info(colored("----------------------------", bold=True))
     logger.info(colored("END of EPG to ESG conversion", bold=True))
     logger.info(colored("----------------------------\n", bold=True))
+
     if returnCode == ReturnCode.SUCCESS:
         logger.info("ESG conversion completed successfully.")
     elif returnCode == ReturnCode.USERSKIPPED:
@@ -3778,7 +3833,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
     returnCode = ReturnCode.SUCCESS
 
     def logAndPost(outputElem, step = None, allowYesToAll = True):
-        return logAndPostHandler(outputElem, node, outputFile = outputFile, noConfig = noConfig, step = step, allowYesToAll = allowYesToAll)
+        return logAndPostHandler(outputElem, node, noConfig = noConfig, step = step, allowYesToAll = allowYesToAll)
 
     def findClassInstancesWithTag(className, tagKey, tagVal, skipConfigIssues):
         """
@@ -3800,6 +3855,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
 
         return matchingMos
 
+    # Erase output file if it already exists
     try:
         with open(outputFile, "w") as _:
             pass
@@ -3809,11 +3865,13 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
 
     cleanupEPgs = {}
     cleanupContracts = {}
+    cleanupContractIfs = {}
     cleanupProvContractToEpgTenantMap = {}
     cleanupExternalSubnets = {}
     instPToSubnetMap = {}
     instPToExtSubnetSelMap = {}
     globalConfigToPost = node.mit.polUni()
+    globalConfigOutputFile = node.mit.polUni()
     perVrfConfigToPost = {}
     cleanupSequence = []
 
@@ -3881,7 +3939,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
             esgTenantName = getTenantFromDn(epgSelectorDn)
             esgApName = getAppProfileFromDn(epgSelectorDn)
             esgName = epgSelectorDn.split('/')[3].removeprefix("esg-")  # fvESg is always the 4th segment in the Dn
-            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                 config.fvTenant(esgTenantName).fvAp(esgApName).fvESg(name=esgName).fvEPgSelector(matchEpgDn=epgDn).tagAnnotation(key=migrationAnnotateKey, status='deleted')
 
         epgMo = sourceSubtree[0]
@@ -3897,28 +3955,27 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
 
             for epgChildren in epgMo.Children:
                 if epgChildren.ClassName == 'fvRsProv':
-                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                         config.fvTenant(epgTenantName).fvAp(epgApName).fvAEPg(name=epgName).fvRsProv(tnVzBrCPName=epgChildren.tnVzBrCPName, status='deleted')
                     cleanupProvContractToEpgTenantMap[epgChildren.tDn] = epgTenantName
                     cleanupContracts.setdefault(epgChildren.tDn, set())
                     cleanupContracts[epgChildren.tDn].add(buildReverseRelation(epgDn, epgChildren.tDn, 'fvRsProv'))
                 elif epgChildren.ClassName == 'fvRsCons':
-                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                         config.fvTenant(epgTenantName).fvAp(epgApName).fvAEPg(name=epgName).fvRsCons(tnVzBrCPName=epgChildren.tnVzBrCPName, status='deleted')
                     cleanupContracts.setdefault(epgChildren.tDn, set())
                     cleanupContracts[epgChildren.tDn].add(buildReverseRelation(epgDn, epgChildren.tDn, 'fvRsCons'))
                 elif epgChildren.ClassName == 'fvRsIntraEpg':
-                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                         config.fvTenant(epgTenantName).fvAp(epgApName).fvAEPg(name=epgName).fvRsIntraEpg(tnVzBrCPName=epgChildren.tnVzBrCPName, status='deleted')
                     cleanupContracts.setdefault(epgChildren.tDn, set())
                     cleanupContracts[epgChildren.tDn].add(buildReverseRelation(epgDn, epgChildren.tDn, 'fvRsIntraEpg'))
                 elif epgChildren.ClassName == 'fvRsConsIf':
-                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                         config.fvTenant(epgTenantName).fvAp(epgApName).fvAEPg(name=epgName).fvRsConsIf(tnVzCPIfName=epgChildren.tnVzCPIfName, status='deleted')
-                    cleanupContracts.setdefault(epgChildren.tDn, set())
-                    cleanupContracts[epgChildren.tDn].add(buildReverseRelation(epgDn, epgChildren.tDn, 'fvRsConsIf'))
+                    cleanupContractIfs.setdefault(epgChildren.tDn, set()).add(buildReverseRelation(epgDn, epgChildren.tDn, 'fvRsConsIf'))
                 elif epgChildren.ClassName == 'fvRsSecInherited':
-                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                         config.fvTenant(epgTenantName).fvAp(epgApName).fvAEPg(name=epgName).fvRsSecInherited(tDn=epgChildren.tDn, status='deleted')
                 elif epgChildren.ClassName == 'fvSubnet':
                     scopeFlags = [flag.strip() for flag in epgChildren.scope.split(",")]
@@ -3940,11 +3997,11 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                         # then just remove shared scope instead of deleting the subnet
                         if not bdSubnetSubtree or len(bdSubnetSubtree) == 0:
                             scopeFlags.remove("shared")
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 subnet = config.fvTenant(epgTenantName).fvAp(epgApName).fvAEPg(name=epgName).fvSubnet(ip=epgChildren.ip, scope=",".join(scopeFlags))
                                 subnet.xmlcomment = "Subnet not deleted since {}. Remove shared scope".format(reason)
                         else:
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(epgTenantName).fvAp(epgApName).fvAEPg(name=epgName).fvSubnet(ip=epgChildren.ip, status='deleted')
         elif epgMo.ClassName == 'l3extInstP':
             if epgDn in instPToExtSubnetSelMap:
@@ -3953,7 +4010,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                     esgApName = getAppProfileFromDn(extSubnetSelDn)
                     esgName = extSubnetSelDn.split('/')[3].removeprefix("esg-")  # fvESg is always the 4th segment in the Dn
                     ip = extSubnetSelDn.split('extsubselector-[')[1].split(']')[0]
-                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                    for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                         config.fvTenant(esgTenantName).fvAp(esgApName).fvESg(name=esgName).fvExternalSubnetSelector(ip=ip).tagAnnotation(key=migrationAnnotateKey, status='deleted')
             allSecuritySubnetHandled = True
             for epgChildren in epgMo.Children:
@@ -3962,10 +4019,10 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                     if epgDn in instPToSubnetMap and epgChildren.ip in instPToSubnetMap[epgDn]:
                         scope = [flag for flag in scopeFlags if flag not in ['import-security', 'shared-security', 'shared-rtctrl']]
                         if len(scope) == 0:
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(epgTenantName).l3extOut(name=epgL3OutName).l3extInstP(name=epgName).l3extSubnet(ip=epgChildren.ip, status='deleted')
                         elif scope != scopeFlags:
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 subnet = config.fvTenant(epgTenantName).l3extOut(name=epgL3OutName)\
                                                 .l3extInstP(name=epgName).l3extSubnet(ip=epgChildren.ip, scope=",".join(scope))
                                 subnet.xmlcomment = "Subnet not deleted since other flags are present. Reset only security and route leak flags"
@@ -3975,26 +4032,25 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
             if allSecuritySubnetHandled:
                 for epgChildren in epgMo.Children:
                     if epgChildren.ClassName == 'fvRsProv':
-                        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                             config.fvTenant(epgTenantName).l3extOut(epgL3OutName).l3extInstP(name=epgName).fvRsProv(tnVzBrCPName=epgChildren.tnVzBrCPName, status='deleted')
                         cleanupProvContractToEpgTenantMap[epgChildren.tDn] = epgTenantName
                         cleanupContracts.setdefault(epgChildren.tDn, set())
                         cleanupContracts[epgChildren.tDn].add(buildReverseRelation(epgDn, epgChildren.tDn, 'fvRsProv'))
                     elif epgChildren.ClassName == 'fvRsCons':
-                        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                             config.fvTenant(epgTenantName).l3extOut(epgL3OutName).l3extInstP(name=epgName).fvRsCons(tnVzBrCPName=epgChildren.tnVzBrCPName, status='deleted')
                         cleanupContracts.setdefault(epgChildren.tDn, set())
                         cleanupContracts[epgChildren.tDn].add(buildReverseRelation(epgDn, epgChildren.tDn, 'fvRsCons'))
                     elif epgChildren.ClassName == 'fvRsIntraEpg':
-                        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                             config.fvTenant(epgTenantName).l3extOut(epgL3OutName).l3extInstP(name=epgName).fvRsIntraEpg(tnVzBrCPName=epgChildren.tnVzBrCPName, status='deleted')
                         cleanupContracts.setdefault(epgChildren.tDn, set())
                         cleanupContracts[epgChildren.tDn].add(buildReverseRelation(epgDn, epgChildren.tDn, 'fvRsIntraEpg'))
                     elif epgChildren.ClassName == 'fvRsConsIf':
-                        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                             config.fvTenant(epgTenantName).l3extOut(epgL3OutName).l3extInstP(name=epgName).fvRsConsIf(tnVzCPIfName=epgChildren.tnVzCPIfName, status='deleted')
-                        cleanupContracts.setdefault(epgChildren.tDn, set())
-                        cleanupContracts[epgChildren.tDn].add(buildReverseRelation(epgDn, epgChildren.tDn, 'fvRsConsIf'))
+                        cleanupContractIfs.setdefault(epgChildren.tDn, set()).add(buildReverseRelation(epgDn, epgChildren.tDn, 'fvRsConsIf'))
         else:
             continue
 
@@ -4025,20 +4081,20 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                         and grandchild.key == migrationAnnotateKey \
                         and grandchild.value == migrationAnnotateVal:
                         if child.ClassName == "fvRsProv":
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvRsProv(tnVzBrCPName=child.tnVzBrCPName, status='deleted')
+                            cleanupProvContractToEpgTenantMap[child.tDn] = tenantName
                             cleanupContracts.setdefault(child.tDn, set())
                             cleanupContracts[child.tDn].add(buildReverseRelation(inbMo.dn, child.tDn, 'fvRsProv'))
                         elif child.ClassName == "fvRsCons":
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvRsCons(tnVzBrCPName=child.tnVzBrCPName, status='deleted')
                             cleanupContracts.setdefault(child.tDn, set())
                             cleanupContracts[child.tDn].add(buildReverseRelation(inbMo.dn, child.tDn, 'fvRsCons'))
                         elif child.ClassName == "fvRsConsIf":
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvRsConsIf(tnVzCPIfName=child.tnVzCPIfName, status='deleted')
-                            cleanupContracts.setdefault(child.tDn, set())
-                            cleanupContracts[child.tDn].add(buildReverseRelation(inbMo.dn, child.tDn, 'fvRsConsIf'))
+                            cleanupContractIfs.setdefault(child.tDn, set()).add(buildReverseRelation(inbMo.dn, child.tDn, 'fvRsConsIf'))
                         break
 
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
@@ -4067,7 +4123,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         perVrfConfigToPost.setdefault(vrfDn, node.mit.polUni())
         perEpgConfig = node.mit.polUni()
         # Cleanup fvESg Tag Annotation
-        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
             config.fvTenant(tenantName).fvAp(apName).fvESg(esgName).tagAnnotation(key=migrationAnnotateKey, status="deleted")
         for child in fvESgSubtree[0].Children:
             if child.ClassName in ("fvRsProv", "fvRsCons", "fvRsConsIf"):
@@ -4076,17 +4132,18 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                         and grandchild.key == migrationAnnotateKey \
                         and grandchild.value == migrationAnnotateVal:
                         if child.ClassName == "fvRsProv":
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).fvAp(apName).fvESg(esgName).fvRsProv(tnVzBrCPName=child.tnVzBrCPName, status='deleted')
+                            cleanupProvContractToEpgTenantMap[child.tDn] = tenantName
                             cleanupContracts.setdefault(child.tDn, set()).add(buildReverseRelation(esgDn, child.tDn, 'fvRsProv'))
                         elif child.ClassName == "fvRsCons":
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).fvAp(apName).fvESg(esgName).fvRsCons(tnVzBrCPName=child.tnVzBrCPName, status='deleted')
                             cleanupContracts.setdefault(child.tDn, set()).add(buildReverseRelation(esgDn, child.tDn, 'fvRsCons'))
                         elif child.ClassName == "fvRsConsIf":
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).fvAp(apName).fvESg(esgName).fvRsConsIf(tnVzCPIfName=child.tnVzCPIfName, status='deleted')
-                            cleanupContracts.setdefault(child.tDn, set()).add(buildReverseRelation(esgDn, child.tDn, 'fvRsConsIf'))
+                            cleanupContractIfs.setdefault(child.tDn, set()).add(buildReverseRelation(esgDn, child.tDn, 'fvRsConsIf'))
                         break
 
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
@@ -4102,7 +4159,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         perVrfConfigToPost.setdefault(vrfDn, node.mit.polUni())
         perEpgConfig = node.mit.polUni()
         # Cleanup vzAny Tag Annotation
-        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+        for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
             config.fvTenant(tenantName).fvCtx(vrfName).vzAny().tagAnnotation(key=migrationAnnotateKey, status="deleted")
 
         params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all'}
@@ -4116,20 +4173,20 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                         and grandchild.key == migrationAnnotateKey \
                         and grandchild.value == migrationAnnotateVal:
                         if child.ClassName == "vzRsAnyToProv":
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).fvCtx(vrfName).vzAny().vzRsAnyToProv(tnVzBrCPName=child.tnVzBrCPName, status='deleted')
+                            cleanupProvContractToEpgTenantMap[child.tDn] = tenantName
                             cleanupContracts.setdefault(child.tDn, set())
                             cleanupContracts[child.tDn].add(buildReverseRelation(vzAnyMo.dn, child.tDn, 'vzRsAnyToProv'))
                         elif child.ClassName == "vzRsAnyToCons":
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).fvCtx(vrfName).vzAny().vzRsAnyToCons(tnVzBrCPName=child.tnVzBrCPName, status='deleted')
                             cleanupContracts.setdefault(child.tDn, set())
                             cleanupContracts[child.tDn].add(buildReverseRelation(vzAnyMo.dn, child.tDn, 'vzRsAnyToCons'))
                         elif child.ClassName == "vzRsAnyToConsIf":
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost]:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).fvCtx(vrfName).vzAny().vzRsAnyToConsIf(tnVzCPIfName=child.tnVzCPIfName, status='deleted')
-                            cleanupContracts.setdefault(child.tDn, set())
-                            cleanupContracts[child.tDn].add(buildReverseRelation(vzAnyMo.dn, child.tDn, 'vzRsAnyToConsIf'))
+                            cleanupContractIfs.setdefault(child.tDn, set()).add(buildReverseRelation(vzAnyMo.dn, child.tDn, 'vzRsAnyToConsIf'))
                         break
 
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
@@ -4165,11 +4222,56 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
     cleanupSequence = []
     globalConfigToPost = node.mit.polUni()
     perTenantConfigToPost = {}
-    cleanupContracts.pop('', None)
     deletedProvContracts = defaultdict(set) # EPG Tenant to Deleted Provider Contract Set
-    contractRelClasses = ['vzRtCons', 'vzRtProv', 'vzRtIntraEpg', 'vzRtConsIf', 'vzRtAnyToCons', 'vzRtAnyToProv', 'vzRtAnyToConsIf']
+    contractRelClasses = ['vzRtCons', 'vzRtProv', 'vzRtIntraEpg', 'vzRtConsIf', 'vzRtIf', 'vzRtAnyToCons', 'vzRtAnyToProv', 'vzRtAnyToConsIf']
+
+    # Cleanup Contract Interfaces first
+    contractNum = 0
+    contractNumTot = len(cleanupContractIfs)
+    cleanupContractIfs.pop('', None)
+    for contract, deletedRtRelations in sorted(cleanupContractIfs.items()):
+        contractNum += 1
+        exportedFromDn = None
+        spinner.text = "Analyzing configuration for contract {}/{}: {}".format(contractNum, contractNumTot, contract)
+
+        perContractConfig = node.mit.polUni()
+        contractCleanup = True
+        tenant = getTenantFromDn(contract)
+        perTenantConfigToPost.setdefault(tenant, node.mit.polUni())
+        contractName = getNameFromDn(contract)
+
+        params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all', 'rsp-subtree-class': 'vzRsIf,' + ','.join(contractRelClasses)}
+        sourceSubtree = callApiWithRetry(node, node.mit.FromDn(contract).GET, **params)
+        if not sourceSubtree or len(sourceSubtree) == 0:
+            logger.error(f"Error in retrieving and cleaning up contract {contract} on {tenant}. Skipping cleanup of this contract.")
+            continue
+        for childMo in sourceSubtree[0].Children:
+            if childMo.ClassName == 'vzRsIf':
+                exportedFromDn = childMo.tDn
+            if childMo.ClassName in contractRelClasses:
+                if childMo.Dn not in deletedRtRelations:
+                    contractCleanup = False
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("Contract {} still has RT relations. Skipping cleanup of this contract.".format(contract))
+                    break
+
+        if contractCleanup:
+            for config in [perContractConfig, perTenantConfigToPost[tenant], globalConfigToPost, globalConfigOutputFile]:
+                config.fvTenant(tenant).vzCPIf(name=contractName, status='deleted')
+            if contract in cleanupProvContractToEpgTenantMap:
+                deletedProvContracts[cleanupProvContractToEpgTenantMap[contract]].add(contractName)
+            # Add vzRtIf to the contract relation set
+            if exportedFromDn:
+                cleanupContracts.setdefault(exportedFromDn, set()).add(buildReverseRelation(contract, exportedFromDn, 'vzRsIf'))
+
+            if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perContractConfig.Children)):
+                cleanupSequence.append({'text': "Cleaning up contract {} on tenant {}"
+                                        .format(colored(contractName), colored(tenant)), 'config': perContractConfig})
+
+    # Cleanup Contracts next
     contractNum = 0
     contractNumTot = len(cleanupContracts)
+    cleanupContracts.pop('', None)
     for contract, deletedRtRelations in sorted(cleanupContracts.items()):
         contractNum += 1
         spinner.text = "Analyzing configuration for contract {}/{}: {}".format(contractNum, contractNumTot, contract)
@@ -4180,12 +4282,10 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         perTenantConfigToPost.setdefault(tenant, node.mit.polUni())
         contractName = getNameFromDn(contract)
 
-        params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all',
-               'rsp-subtree-class': 'vzRtCons,vzRtProv,vzRtIntraEpg,vzRtConsIf,vzRtAnyToCons,vzRtAnyToProv,vzRtAnyToConsIf'}
+        params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all', 'rsp-subtree-class': ','.join(contractRelClasses)}
         sourceSubtree = callApiWithRetry(node, node.mit.FromDn(contract).GET, **params)
         if not sourceSubtree or len(sourceSubtree) == 0:
             logger.error(f"Error in retrieving and cleaning up contract {contract} on {tenant}. Skipping cleanup of this contract.")
-            spinner.text = "Analyzing configuration for contract {}/{}: {}".format(contractNum, contractNumTot, contract)
             continue
         for childMo in sourceSubtree[0].Children:
             if childMo.ClassName in contractRelClasses:
@@ -4196,12 +4296,8 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                     break
 
         if contractCleanup:
-            if "/brc-" in contract:
-                for config in [perContractConfig, perTenantConfigToPost[tenant], globalConfigToPost]:
-                    config.fvTenant(tenant).vzBrCP(name=contractName, status='deleted')
-            elif "/cif-" in contract:
-                for config in [perContractConfig, perTenantConfigToPost[tenant], globalConfigToPost]:
-                    config.fvTenant(tenant).vzCPIf(name=contractName, status='deleted')
+            for config in [perContractConfig, perTenantConfigToPost[tenant], globalConfigToPost, globalConfigOutputFile]:
+                config.fvTenant(tenant).vzBrCP(name=contractName, status='deleted')
             if contract in cleanupProvContractToEpgTenantMap:
                 deletedProvContracts[cleanupProvContractToEpgTenantMap[contract]].add(contractName)
 
@@ -4245,7 +4341,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         perTenantConfigToPost.setdefault(vnsTenant, node.mit.polUni())
         # Provider EP and PBR Logical Device Context should be in same tenant
         if vnsLDevCtxMo.ctrctNameOrLbl in deletedProvContracts[vnsTenant]:
-            for config in [perContractConfig, perTenantConfigToPost[vnsTenant], globalConfigToPost]:
+            for config in [perContractConfig, perTenantConfigToPost[vnsTenant], globalConfigToPost, globalConfigOutputFile]:
                 config.fvTenant(vnsTenant).vnsLDevCtx(ctrctNameOrLbl=vnsLDevCtxMo.ctrctNameOrLbl,
                                                       graphNameOrLbl=vnsLDevCtxMo.graphNameOrLbl,
                                                       nodeNameOrLbl=vnsLDevCtxMo.nodeNameOrLbl,
@@ -4277,6 +4373,19 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
     logger.info(colored("-----------------------------------------", bold=True))
     logger.info(colored("END of PBR Logical Device Context cleanup", bold=True))
     logger.info(colored("-----------------------------------------\n", bold=True))
+
+    try:
+        with open(outputFile, "w") as f:
+            if outputFile.endswith(".xml"):
+                f.write(globalConfigOutputFile.GetXml())
+            elif outputFile.endswith(".json"):
+                f.write(globalConfigOutputFile.Json)
+    except Exception as fe:
+        logger.error("Failed to write output config to file {} due to {}".format(outputFile, fe))
+
+    logger.info(colored("----------------------------", bold=True))
+    logger.info(colored("END of Cleanup", bold=True))
+    logger.info(colored("----------------------------\n", bold=True))
 
     if returnCode == ReturnCode.SUCCESS:
         logger.info("Cleanup completed successfully.")
@@ -4606,6 +4715,7 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     esgToVrfMap = {}
     perVrfPreExistingEsgMap = {}
     if not validateInputYamlData(esgDataFromYaml, vrfsInYaml, esgToVrfMap):
+        logger.error("YAML file validation: FAIL")
         sys.exit(1)
     else:
         logger.info("YAML file validation: PASS")
