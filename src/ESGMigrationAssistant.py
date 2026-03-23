@@ -1555,19 +1555,30 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
         # Sort the subnets by prefix length (smallest to largest) and then iterate over the sorted list
         # to remove subnets that are included in other subnets. This is needed to avoid having duplicated
         # leak routes in ESG when multiple EPGs are leaking overlapping subnets.
-        networks = [(ipaddress.ip_network(subnet), scope) for subnet, scope in subnetSet]
-        networks.sort(key=lambda x: x[0].prefixlen)
+
+        networks4 = []
+        networks6 = []
+        for ip, scope in subnetSet:
+            network = ipaddress.ip_network(ip)
+            if network.version == 4:
+                networks4.append((network, scope))
+            else:
+                networks6.append((network, scope))
 
         networkFinal = []
-        for ip, scope in networks:
-            largerPresent = False
-            for existingIp, _ in networkFinal:
-                if ip.subnet_of(existingIp):
-                    largerPresent = True
-                    break
-            if not largerPresent:
-                networkFinal.append((ip, scope))
-        return set((str(ip), scope) for ip, scope in networkFinal)
+        for version in (4, 6):
+            versionNetworks = networks4 if version == 4 else networks6
+            versionNetworks.sort(key=lambda x: x[0].prefixlen)
+
+            for ip, scope in versionNetworks:
+                largerPresent = False
+                for existingIp, _ in networkFinal:
+                    if ip.subnet_of(existingIp):
+                        largerPresent = True
+                        break
+                if not largerPresent:
+                    networkFinal.append((ip, scope))
+        return set((str(ip), scope) for ip, scope in networkFinal) 
 
     for fromVrf, targets in leakSubnetsFromTo.items():
         for vrf in jsonResult['vrfs']:
@@ -2933,44 +2944,59 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         Clones contracts from EPG to ESG.
         """
 
-        def appendContract(contract):
-            tenantName = getTenantFromDn(contract.Dn)
-            if tenantName not in perTenantConfigToPost:
-                perTenantConfigToPost[tenantName] = node.mit.polUni()
-
-            for config in [perTenantConfigToPost[tenantName], globalConfigOutputFile]:
-                config.fvTenant(tenantName)
-                uniJson = json.loads(config.Json)
-                for child in uniJson["polUni"]["children"]:
-                    tenant = child.get("fvTenant")
-                    if tenant and tenant.get("attributes", {}).get("name") == tenantName:
-                        tenant.setdefault("children", []).append(json.loads(contract.Json))
-                        config.Json = json.dumps(uniJson)
-
         rc = ReturnCode.SUCCESS
         perTenantConfigToPost = {}
+        perTenantConfigToPostText = {}
+        perTenantConfigJson = {}
+        tenantSet = set()
         for contact in contractConversionDescriptor.getAll():
             oldContractDn = contact['fromDn']
-            newContractMo = contact['mo']
-            ndContract = contact['ndContract']
+            tenantName = getTenantFromDn(oldContractDn)
+            if tenantName not in tenantSet:
+                perTenantConfigToPost.setdefault(tenantName, node.mit.polUni()).fvTenant(tenantName)
+                perTenantConfigToPostText.setdefault(tenantName, [])
+                globalConfigOutputFile.fvTenant(tenantName)
+                tenantSet.add(tenantName)
+            perTenantConfigToPostText[tenantName].append(oldContractDn)
 
+        # Convert Mo to Json for easier manipulation when adding cloned contracts to tenant config
+        for tenantName in tenantSet:
+            perTenantConfigJson[tenantName] = json.loads(perTenantConfigToPost[tenantName].Json)
+        globalJson = json.loads(globalConfigOutputFile.Json)
+
+        for contact in contractConversionDescriptor.getAll():
+            newContractMo = contact['mo']
+            oldContractDn = contact['fromDn']
+            tenantName = getTenantFromDn(oldContractDn)
             if not newContractMo:
                 logger.error("Missing Cloned Contract for source DN {}".format(oldContractDn))
                 rc |= ReturnCode.GETFAILED
                 continue
 
-            if ndContract:
+            if contact['ndContract']:
                 newContractMo.tagAnnotation(key = ndContractAnnotateKey, value = oldContractDn)
 
-            logger.info("Cloning contract from {}".format(colored(oldContractDn)))
+            newContractMoJson = json.loads(newContractMo.Json)
+            for config in [perTenantConfigJson[tenantName], globalJson]:
+                for child in config["polUni"]["children"]:
+                    tenant = child.get("fvTenant")
+                    if tenant and tenant.get("attributes", {}).get("name") == tenantName:
+                        tenant.setdefault("children", []).append(newContractMoJson)
+
             if not inputHandler.isYesToAll() and configStrategy == ConfigStrategy.INTERACTIVE:
+                logger.info("Cloning contract from {}".format(colored(oldContractDn)))
                 rc |= logAndPost(newContractMo, step = steps['contractClones'])
-            else:
-                appendContract(newContractMo)
+
+        # Convert back to Mo from Json after adding all cloned contracts to tenant config
+        for tenantName in tenantSet:
+            perTenantConfigToPost[tenantName].Json = json.dumps(perTenantConfigJson[tenantName])
+        globalConfigOutputFile.Json = json.dumps(globalJson)
 
         if inputHandler.isYesToAll() or configStrategy == ConfigStrategy.VRF:
             step = {'current': 1, 'total': len(perTenantConfigToPost)}
-            for _, config in sorted(perTenantConfigToPost.items()):
+            for tenantName, config in sorted(perTenantConfigToPost.items()):
+                for oldContractDn in perTenantConfigToPostText[tenantName]:
+                    logger.info("Cloning contract from {}".format(colored(oldContractDn)))
                 rc |= logAndPost(config, step = step)
 
         return rc
