@@ -968,7 +968,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     brCPToProvider = {}
     vzAnyPrefGrMembrship = {}
     epgsAssignedToSelector = set()
-    vrfsWithVzAnyContract = set()
+    vrfVzAnyContractLayout = {}
     epgsWithUnsupportedFeatures = {}
     contractsWithUnsupportedFeatures = {}
     perVrfExternalSubnetSelectors = {}
@@ -1056,17 +1056,23 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                                 targetEpgDn = cpChildMo.getProp('tDn')
                                 if targetEpgDn:
                                     targetConsEpgDns.add(targetEpgDn)
-                                    vrfsWithVzAnyContract.add(targetEpgDn.rsplit('/', 1)[0])
+                                    vrfDn = targetEpgDn.rsplit('/', 1)[0]
+                                    vrfVzAnyContractLayout.setdefault(vrfDn, {"providers": set(), "consumers": set()})
+                                    vrfVzAnyContractLayout[vrfDn]["consumers"].add(vzBrCPDn)
                 elif childMo.ClassName == "vzRtAnyToProv":
                     targetEpgDn = childMo.getProp('tDn')
                     if targetEpgDn:
                         targetProvEpgDns.add(targetEpgDn)
-                        vrfsWithVzAnyContract.add(targetEpgDn.rsplit('/', 1)[0])
+                        vrfDn = targetEpgDn.rsplit('/', 1)[0]
+                        vrfVzAnyContractLayout.setdefault(vrfDn, {"providers": set(), "consumers": set()})
+                        vrfVzAnyContractLayout[vrfDn]["providers"].add(vzBrCPDn)
                 elif childMo.ClassName == "vzRtAnyToCons":
                     targetEpgDn = childMo.getProp('tDn')
                     if targetEpgDn:
                         targetConsEpgDns.add(targetEpgDn)
-                        vrfsWithVzAnyContract.add(targetEpgDn.rsplit('/', 1)[0])
+                        vrfDn = targetEpgDn.rsplit('/', 1)[0]
+                        vrfVzAnyContractLayout.setdefault(vrfDn, {"providers": set(), "consumers": set()})
+                        vrfVzAnyContractLayout[vrfDn]["consumers"].add(vzBrCPDn)
                 elif childMo.ClassName == "vzSubj":
                     contractToFilterDescriptor.setdefault(childMo.Dn, {"contractDn": vzBrCPDn, "revFltPorts": childMo.getProp('revFltPorts'), "filterDns": set()})
                     for subjChildMo in childMo.Children:
@@ -1267,17 +1273,30 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                         tDn = match.group(1)
                         inheritedFrom[epgDn].add(tDn)
 
+            # Collect contracts from vzAny contract layout if applicable
+            if epgDescriptor['vrf'] in vrfVzAnyContractLayout:
+                for contract in vrfVzAnyContractLayout[epgDescriptor['vrf']]["providers"]:
+                    epgDescriptor['contracts'].add("{}:{}".format("vzanyprov", contract))
+                for contract in vrfVzAnyContractLayout[epgDescriptor['vrf']]["consumers"]:
+                    epgDescriptor['contracts'].add("{}:{}".format("vzanycons", contract))
+
             epgLayout[epgDn] = epgDescriptor
 
             if noFiltersUsed or epgDescriptor['vrf'] in aggregateFilterVrfDns:
-                externalSubnetLayout.setdefault(epgDescriptor['vrf'], {})
+                externalSubnetLayout.setdefault(epgDescriptor['vrf'], {'__ipv4Default__$': False, '__ipv6Default__$': False})
                 for subnet in epgDescriptor['externalSubnets']:
                     ip = subnet[0]
+                    if ip == "0.0.0.0/0":
+                        externalSubnetLayout[epgDescriptor['vrf']]['__ipv4Default__$'] = True
+                    elif ip == "::/0":
+                        externalSubnetLayout[epgDescriptor['vrf']]['__ipv6Default__$'] = True
                     # Check for duplicate l3extSubnet in the same VRF
                     for extEpg, externalSubnets in externalSubnetLayout[epgDescriptor['vrf']].items():
+                        if extEpg == '__ipv4Default__$' or extEpg == '__ipv6Default__$':
+                            continue
                         for acceptedSubnet in externalSubnets:
                             if ip == acceptedSubnet[0]:
-                                logger.error("Aborting analysis since External EPG {} and External EPG {} in VRF {} are mathing the same l3extSubnet {}.\nThis configuration is not supported in ESG since duplicate external subnet selectors in the same VRF are not allowed."
+                                logger.error("Aborting analysis:\nExternal EPG {} and External EPG {} in VRF {} are mathing the same l3extSubnet {}.\nThis configuration is not supported in ESG since duplicate external subnet selectors in the same VRF are not allowed."
                                              .format(colored(epgDn), colored(extEpg), colored(epgDescriptor['vrf']), colored(ip)))
                                 sys.exit(1)
                 externalSubnetLayout[epgDescriptor['vrf']][epgDn] = epgDescriptor['externalSubnets']
@@ -1308,10 +1327,10 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     logger.info(colored("------------------------------------", bold=True))
     logger.info(colored("RESULTS - Mode {}".format(mode), bold=True))
     logger.info(colored("------------------------------------", bold=True))
-    for epgDn, epgData in epgLayout.items():
+    for epgDn, epgData in sorted(epgLayout.items()):
         vrfDn = epgData['vrf']
         if (epgData['ignoreMigration']) or \
-           (not epgData['contracts'] and vrfDn not in vrfsWithVzAnyContract) or \
+           (not epgData['contracts'] and vrfDn not in vrfVzAnyContractLayout) or \
            (filtersUsed and vrfDn not in aggregateFilterVrfDns) or \
            (epgDn in visitedEpgs):
             if not spinner.isRunning():
@@ -1319,7 +1338,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
             continue
         if epgData['unsupportedFeatures']:
             lenUnsupported = len(epgData['unsupportedFeatures'])
-            logger.error("Aborting analysis since EPG {} in VRF {} has unsupported features. The unsupported features {}: {}."
+            logger.error("Aborting analysis:\nEPG {} in VRF {} has unsupported features. The unsupported features {}: {}."
                          .format(colored(epgDn), colored(vrfDn),
                                  "are" if lenUnsupported > 1 else "is", colored(", ".join(sorted(epgData['unsupportedFeatures'])))))
             sys.exit(1)
@@ -1382,6 +1401,8 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                     visitedEpgs.add(otherEpgDn)
 
         if epgData['inbOrVzany'] or epgData['className'] == "fvESg":
+            groupCount += 1
+            name = "ESG_{}_{}_{}".format(tenantName, appProfileName, groupCount)
             esgDn = epgDn
         else:
             if mode == 'one-to-one' or len(epgSelectors) <= 1:
@@ -1412,9 +1433,10 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
             if contractDn not in contractDnToESGMapping:
                 contractDnToESGMapping[contractDn] = {'prov': set(), 'cons': set(), 'consif': set(), 'intraepg': set()}
 
-            if contract.startswith('prov:'):
-                esgProv.append(contractDn)
-                contractDnToESGMapping[contractDn]['prov'].add(esgDn)
+            if contract.startswith('prov:') or contract.startswith('vzanyprov:'):
+                if contract.startswith('prov:'):
+                    esgProv.append(contractDn)
+                    contractDnToESGMapping[contractDn]['prov'].add(esgDn)
                 # Get Target VRFs if leak subnets are present
                 if leakInternalSubnetsFromProv or leakExternalPrefixes:
                     consumerEPGs = brCPToConsumer.get(contractDn, set())
@@ -1424,9 +1446,10 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                             logger.warning("Cannot find Vrf for epg: {}".format(consumerEpg))
                         elif vrfDn != consumerVrfDn:
                             leakToConsumerVrfs.add(consumerVrfDn)
-            elif contract.startswith('cons:'):
-                esgCons.append(contractDn)
-                contractDnToESGMapping[contractDn]['cons'].add(esgDn)
+            elif contract.startswith('cons:') or contract.startswith('vzanycons:'):
+                if contract.startswith('cons:'):
+                    esgCons.append(contractDn)
+                    contractDnToESGMapping[contractDn]['cons'].add(esgDn)
                 # Get Target VRFs if leak subnets are present
                 if leakInternalSubnetsFromCons or leakExternalPrefixes:
                     providerEPGs = brCPToProvider.get(contractDn, set())
@@ -1558,6 +1581,8 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
 
         networks4 = []
         networks6 = []
+        networkFinal4 = []
+        networkFinal6 = []
         for ip, scope in subnetSet:
             network = ipaddress.ip_network(ip)
             if network.version == 4:
@@ -1565,26 +1590,44 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
             else:
                 networks6.append((network, scope))
 
-        networkFinal = []
-        for version in (4, 6):
-            versionNetworks = networks4 if version == 4 else networks6
-            versionNetworks.sort(key=lambda x: x[0].prefixlen)
+        networks4.sort(key=lambda x: x[0].prefixlen)
+        networks6.sort(key=lambda x: x[0].prefixlen)
 
-            for ip, scope in versionNetworks:
-                largerPresent = False
-                for existingIp, _ in networkFinal:
-                    if ip.subnet_of(existingIp):
-                        largerPresent = True
-                        break
-                if not largerPresent:
-                    networkFinal.append((ip, scope))
-        return set((str(ip), scope) for ip, scope in networkFinal) 
+        for ip, scope in networks4:
+            largerPresent = False
+            for existingIp, _ in networkFinal4:
+                if ip.subnet_of(existingIp):
+                    largerPresent = True
+                    break
+            if not largerPresent:
+                networkFinal4.append((ip, scope))
+        for ip, scope in networks6:
+            largerPresent = False
+            for existingIp, _ in networkFinal6:
+                if ip.subnet_of(existingIp):
+                    largerPresent = True
+                    break
+            if not largerPresent:
+                networkFinal6.append((ip, scope))
 
+        return set((str(ip), scope) for ip, scope in networkFinal4 + networkFinal6)
+
+    internalSubnetsInToVrfs = {}
+    externalPrefixesInToVrfs = {}
     for fromVrf, targets in leakSubnetsFromTo.items():
         for vrf in jsonResult['vrfs']:
             if vrf['vrf'] == fromVrf:
                 for toVrf, subnetSet in targets['internal'].items():
+                    internalSubnetsInToVrfs.setdefault(toVrf, {})
                     for ip, scope in reduceSubnets(subnetSet):
+                        if ip not in internalSubnetsInToVrfs[toVrf]:
+                            internalSubnetsInToVrfs[toVrf][ip] = fromVrf
+                        else:
+                            logger.error("Aborting analysis:\nVRF {} is receiving duplicated leak internal subnet {} from both {} and {}.\n" \
+                            "ESG enforces stricter validation and detects such misconfigurations early.\n" \
+                            "This configuration is not supported since the same internal subnet cannot be leaked from multiple source VRFs into a single destination VRF."
+                            .format(colored(toVrf), colored(ip), colored(fromVrf), colored(internalSubnetsInToVrfs[toVrf][ip])))
+                            sys.exit(1)
                         found = False
                         for entry in vrf['leakInternalSubnets']:
                             if entry['ip'] == ip and entry['scope'] == scope:
@@ -1595,7 +1638,16 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                             vrf['leakInternalSubnets'].append({'ip': ip, 'scope':scope, 'leakTo': {toVrf}})
 
                 for toVrf, subnetSet in targets['external'].items():
+                    externalPrefixesInToVrfs.setdefault(toVrf, {})
                     for prefix, aggregate in subnetSet:
+                        if prefix not in externalPrefixesInToVrfs[toVrf]:
+                            externalPrefixesInToVrfs[toVrf][prefix] = fromVrf
+                        else:
+                            logger.error("Aborting analysis:\nVRF {} is receiving duplicated leak external prefix {} from both {} and {}.\n" \
+                            "ESG enforces stricter validation and detects such misconfigurations early.\n" \
+                            "This configuration is not supported since the same external prefix cannot be leaked from multiple source VRFs into a single destination VRF."
+                            .format(colored(toVrf), colored(prefix), colored(fromVrf), colored(externalPrefixesInToVrfs[toVrf][prefix])))
+                            sys.exit(1)
                         found = False
                         for entry in vrf['leakExternalPrefixes']:
                             if entry['ip'] == prefix:
@@ -1622,6 +1674,14 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
         vrf['esgs'] = sorted(vrf['esgs'], key=lambda x: x['name'])
         for esg in vrf['esgs']:
             if esg['externalSubnets']:
+                # If the VRF has a ::/0 entry and no 0.0.0.0/0 entry, add a 0.0.0.0/0 entry since if
+                # l3extInstP l3extSubnet matches ::/0 it also internally matches 0.0.0.0/0
+                if externalSubnetLayout.get(vrf['vrf'], {}).get('__ipv6Default__$', False) and \
+                   not externalSubnetLayout.get(vrf['vrf'], {}).get('__ipv4Default__$', False):
+                    for entry in esg['externalSubnets']:
+                        if entry['ip'] == "::/0":
+                            esg['externalSubnets'].append({'ip': "0.0.0.0/0", 'scope': entry['scope']})
+                            break
                 esg['externalSubnets'] = sorted(esg['externalSubnets'], key=lambda x: x['ip'])
             else:
                 del esg['externalSubnets']
@@ -1961,7 +2021,7 @@ def cloneNodeSubtree(apic, sourceDn, targetDn, overrideProps):
 
     return target
 
-def validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap):
+def validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap, existingVrfWithEsgEnabled):
     """
     Helper function to validate ESG to VRF mapping.
     Validates that all VRFs mapped to ESGs exist and that the mapping
@@ -1995,6 +2055,7 @@ def validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap):
     for mo in result:
         if mo.tDn:
             esgDn = mo.Parent.Dn
+            existingVrfWithEsgEnabled.add(mo.tDn)
             if esgDn in esgToVrfMap:
                 expectedVrfDn, esg_line = esgToVrfMap[esgDn]
                 if mo.tDn != expectedVrfDn:
@@ -2346,10 +2407,14 @@ def tcamGetNodeInfo(node):
         if mo.fabricSt != 'active': continue
         podId = getPodIdFromDn(mo.dn)
         if podId:
+            version = parseAciVersion(mo.version)
+            if version[0] > 10:
+                version = (version[0] - 10, version[1], version[2])
             nodeInfo[mo.id] = {'nodeId': int(mo.id), 'podId': podId,
                                'name':mo.name, 'role': mo.role, 'model': mo.model,
                                'scaleProfile': 'unknown',
-                               'tcamUsage': 0, 'tcamCapacity': 0, 'tcamUsagePercent': 0.0, 'vrfCount': 0}
+                               'tcamUsage': 0, 'tcamCapacity': 0, 'tcamUsagePercent': 0.0, 'vrfDeployed': set(),
+                               'version': version, 'versionStr': mo.version}
 
     # Get Node Scale Profile
     result = node.methods.ResolveClass('topoctrlFwdScaleProf').GET()
@@ -2410,32 +2475,47 @@ def capacityCheck(node, fabricDescriptor, vrfConversionSet, noConfig):
     nodeCritical = []
     vrfWithWarnings = set()
     vrfWithCritical = set()
+    nodesWithUnsupportedVersion = set()
+    nodesWithVersionFailure = set()
     nodeInfo = tcamGetNodeInfo(node)
     tcamCapacityCheck(node, nodeInfo)
 
-    spinner.text = "Calculate VRF to node deployment"
+    spinner.text = "Check Nodes Version and calculate VRF to node deployment"
 
     for nodeId, data in nodeInfo.items():
         if data['tcamUsagePercent'] >= 80.0:
             nodeCritical.append(nodeId)
         elif data['tcamUsagePercent'] >= 50.0:
             nodeWarnings.append(nodeId)
+        if data['version'] < (6, 1, 4):
+            nodesWithUnsupportedVersion.add(nodeId)
 
     # Get VRF to Node deployment
-    if nodeCritical or nodeWarnings:
-        result = callApiWithRetry(node, node.methods.ResolveClass('l3Ctx').GET, **{})
-        for mo in result:
-            nodeId = getNodeIdFromDn(mo.dn)
-            if nodeId and nodeId in nodeInfo:
-                nodeInfo[nodeId]['vrfCount'] += 1
-                ctxPKey = mo.ctxPKey
-                if ctxPKey:
-                    vrfDeployment.setdefault(ctxPKey, set())
-                    vrfDeployment[ctxPKey].add(nodeId)
-                    if nodeId in nodeWarnings:
-                        vrfWithWarnings.add(ctxPKey)
-                    if nodeId in nodeCritical:
-                        vrfWithCritical.add(ctxPKey)
+    # if nodeCritical or nodeWarnings or nodesWithUnsupportedVersion:
+    result = callApiWithRetry(node, node.methods.ResolveClass('l3Ctx').GET, **{})
+    for mo in result:
+        nodeId = getNodeIdFromDn(mo.dn)
+        if nodeId and nodeId in nodeInfo:
+            ctxPKey = mo.ctxPKey
+            if ctxPKey:
+                nodeInfo[nodeId]['vrfDeployed'].add(ctxPKey)
+                if nodeId in nodesWithUnsupportedVersion and ctxPKey in vrfConversionSet:
+                    nodesWithVersionFailure.add(nodeId)
+                vrfDeployment.setdefault(ctxPKey, set())
+                vrfDeployment[ctxPKey].add(nodeId)
+                if nodeId in nodeWarnings:
+                    vrfWithWarnings.add(ctxPKey)
+                if nodeId in nodeCritical:
+                    vrfWithCritical.add(ctxPKey)
+
+    for nodeId in nodesWithVersionFailure:
+        logger.error("Node {} with version {} does not meet the minimum required version. VRFs present in the conversion YAML file are deployed on this node."
+                    .format(nodeId, nodeInfo[nodeId]['versionStr']))
+    if nodesWithVersionFailure:
+        logger.error("Node Version check: FAIL")
+        sys.exit(1)
+    else:
+        logger.info("Nodes Version check: PASS")
 
     if logger.isEnabledFor(logging.DEBUG):
         for ctxPKey in vrfDeployment:
@@ -2793,7 +2873,7 @@ def parseAciVersion(version):
     Returns (major, minor, patch)
     Patch is incremented by 1 for Dev images for compare compatibility with CCO number
     """
-    m = re.match(r"(\d+)\.(\d+)\((\d+)(?:\.(\d+))?([a-z]*)\)", version)
+    m = re.search(r"(\d+)\.(\d+)\((\d+)(?:\.(\d+))?([a-z]*)\)", version)
     if not m:
         raise ValueError(f"Invalid ACI version format: {version}")
     major, minor, patch, build, suffix = m.groups()
@@ -2830,12 +2910,12 @@ def checkApicVersionCompatibility(node, minV=None, maxV=None):
 
         if minVParsed:
             if apic['parseVersion'] < minVParsed:
-                logger.warning(f"APIC {apic['id']} below min version {minV}")
+                logger.error(f"APIC {apic['id']} below min version {minV}")
                 versionCheckPassed = False
 
         if maxVParsed:
             if apic['parseVersion'] > maxVParsed:
-                logger.warning(f"APIC {apic['id']} above max version {maxV}")
+                logger.error(f"APIC {apic['id']} above max version {maxV}")
                 versionCheckPassed = False
 
     return versionCheckPassed
@@ -2877,7 +2957,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     def logAndPost(outputElem, step = "", allowYesToAll = True):
         return logAndPostHandler(outputElem, node, noConfig = noConfig, step = step, allowYesToAll = allowYesToAll)
 
-    def createEsgAndLeakRouteForVrf(vrfData, leakRoute):
+    def createEsgAndLeakRouteForVrf(vrfData, preExistingLeakRoutes):
         vrfDn = vrfData['vrf']
         esgList = vrfData.get('esgs', [])
         leakInternalSubnets = vrfData.get('leakInternalSubnets', [])
@@ -2908,7 +2988,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         for leakInternalSubnet in leakInternalSubnets:
             for leakToVrf in leakInternalSubnet['leakTo']:
                 preExisting = False
-                for existingLeak in leakRoute.get(leakToVrf, []):
+                for existingLeak in preExistingLeakRoutes.get(leakToVrf, []):
                     if existingLeak.overlaps(ipaddress.ip_network(leakInternalSubnet['ip'], strict=False)):
                         preExisting = True
                         break
@@ -3178,12 +3258,13 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                         nodesUpdated.add(getNodeIdFromDn(vlanCktEpDn))
             if not nodesNotUpdated:
                 logger.info("{} {} was updated on all nodes{}{}{} with PC Tag {}"
-                    .format(epgDnToNameStr(epg), epg, " (" if len(nodesUpdated) > 0 else "", ",".join(sorted(nodesUpdated)), ")" if len(nodesUpdated) > 0 else "", pcTag))
+                    .format(epgDnToNameStr(epg), epg, " (" if len(nodesUpdated) > 0 else "",
+                            ",".join(sorted(nodesUpdated, key=int)), ")" if len(nodesUpdated) > 0 else "", pcTag))
                 esgToNodeId.update(nodesUpdated)
             else:
                 logger.info("Waiting for {} {} on node{} {} to update with PC Tag {} (current {})"
                     .format(epgDnToNameStr(epg), epg, "s" if len(nodesNotUpdated) > 1 else "",
-                            ",".join(sorted(nodesNotUpdated)), pcTag, oldPcTag))
+                            ",".join(sorted(nodesNotUpdated, key=int)), pcTag, oldPcTag))
                 spinner.text = "Waiting"
             return len(nodesNotUpdated) == 0
 
@@ -3205,6 +3286,8 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
         def extSubSelConditionFn():
             nodesNotUpdated = set()
+            nodesUpdated = set()
+            oldPcTag = 0
             if ipaddress.ip_network(subnet['ip'], strict=False) == ipaddress.ip_network('0.0.0.0/0') or \
                 ipaddress.ip_network(subnet['ip'], strict=False) == ipaddress.ip_network('::/0'):
                 # These prefixes are split and create two actrlPfxEntry objects, but not on all conditions
@@ -3216,22 +3299,30 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 if str(seg) not in mo.dn:
                     continue
                 if int(mo.pcTag) != pcTag:
-                    logger.info("Waiting for actrlPfxEntry {} on node {} to update with PC Tag {} (current {})"\
-                                .format(mo.dn, getNodeIdFromDn(mo.dn), pcTag, mo.pcTag))
                     nodesNotUpdated.add(getNodeIdFromDn(mo.dn))
-
+                    oldPcTag = int(mo.pcTag)
+                else:
+                    nodesUpdated.add(getNodeIdFromDn(mo.dn))
             if not nodesNotUpdated:
-                logger.info("actrlPfxEntry {} was updated on all nodes with PC Tag {}".format(subnet['ip'], pcTag))
+                logger.info("actrlPfxEntry {} was updated on all nodes{}{}{} with PC Tag {}"
+                            .format(subnet['ip'], " (" if len(nodesUpdated) > 0 else "",
+                                    ",".join(sorted(nodesUpdated, key=int)), ")" if len(nodesUpdated) > 0 else "", pcTag))
+            elif len(nodesUpdated) > 0:
+                logger.info("Waiting for actrlPfxEntry {} on node{} {} to update with PC Tag {} (current {})"
+                            .format(subnet['ip'], "s" if len(nodesNotUpdated) > 1 else "",
+                                    ",".join(sorted(nodesNotUpdated, key=int)), pcTag, oldPcTag))
+                spinner.text = "Waiting"
             return len(nodesNotUpdated) == 0
 
         def extSubSelOnSuccess(_):
             spinner.stop()
             print()
 
-        spinner.text = "Collecting EPGs/Vlans to node deployments (vlanCktEp objects)"
-        concreteResult = callApiWithRetry(node, node.methods.ResolveClass('vlanCktEp').GET, **{})
-        for vlanCktEpMo in concreteResult:
-            epgToNodeToPcTag.setdefault(vlanCktEpMo.epgDn, {})[vlanCktEpMo.dn] = int(vlanCktEpMo.pcTag)
+        if applyConfig:
+            spinner.text = "Collecting EPGs/Vlans to node deployments (vlanCktEp objects)"
+            concreteResult = callApiWithRetry(node, node.methods.ResolveClass('vlanCktEp').GET, **{})
+            for vlanCktEpMo in concreteResult:
+                epgToNodeToPcTag.setdefault(vlanCktEpMo.epgDn, {})[vlanCktEpMo.dn] = int(vlanCktEpMo.pcTag)
 
         esgConfigs = {}
         instPSelectorsConfigPatch = node.mit.polUni()
@@ -3744,7 +3835,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     #
 
     calculatePreExistingEsgContractRelations()
-    leakRoutes = calculatePreExistingLeakRoutes()
+    preExistingLeakRoutes = calculatePreExistingLeakRoutes()
 
     returnCode = ReturnCode.SUCCESS
     logger.info(colored("----------------------------------------------------", bold=True))
@@ -3752,7 +3843,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     logger.info(colored("                       Contracts Clone", bold=True))
     logger.info(colored("----------------------------------------------------", bold=True))
     for vrf in sorted(esgDataForXml['vrfs'], key=lambda x: x['vrf']):
-        returnCode |= createEsgAndLeakRouteForVrf(vrf, leakRoutes.get(vrf['vrf'], {}))
+        returnCode |= createEsgAndLeakRouteForVrf(vrf, preExistingLeakRoutes.get(vrf['vrf'], {}))
 
     if returnCode not in [ReturnCode.SUCCESS, ReturnCode.USERSKIPPED]:
         logger.error("Configuration phase 1: ESGs and Leak Routes Creation did not complete successfully. Please check the logs. Return code: {}".format(returnCode))
@@ -3957,7 +4048,7 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                   'rsp-subtree-class': 'fvRsBd,fvRsProv,fvRsCons,fvRsIntraEpg,fvRsConsIf,fvRsSecInherited,fvSubnet,fvEpNlb,fvEpAnycast,fvEpReachability,l3extSubnet'}
         sourceSubtree = callApiWithRetry(node, node.mit.FromDn(epgDn).GET, **params)
         if not sourceSubtree or len(sourceSubtree) == 0:
-            logger.error(f"There is an Selector configured for EPG {epgDn}, but the EPG does not exist. Skipping cleanup of this EPG.")
+            logger.error(f"There is a Selector configured for EPG {epgDn}, but the EPG does not exist. Skipping cleanup of this EPG.")
             continue
 
         epgSelectorDn = epgData["epgSelector"]
@@ -4085,7 +4176,8 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
 
     spinner.text = "Analyzing configuration for Inband EPG"
     # Cleanup contract relations to InB epgs which have tags to be deleted
-    params = {'rsp-subtree': 'children', 'rsp-prop-include': 'all'}
+    params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all',
+              'rsp-subtree-class': 'fvRsProv,fvRsCons,fvRsConsIf,fvSubnet,fvEpNlb,fvEpAnycast,fvEpReachability,tagAnnotation'}
     inbMos = callApiWithRetry(node, node.methods.ResolveClass('mgmtInB').GET, **params)
     for inbMo in inbMos:
         eppDn = 'uni/epp/inb-[{}]'.format(inbMo.dn)
@@ -4094,18 +4186,21 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
             logger.error(f"Inband EPG {inbMo.dn} does not have an EPP.")
             continue
         vrfDn = eppRequest[0].ctxDefDn.removeprefix("uni/ctx-[").removesuffix("]")
+        bdDn = eppRequest[0].bdDefDn.removeprefix("uni/bd-[").split("]")[0]
         perVrfConfigToPost.setdefault(vrfDn, node.mit.polUni())
 
         tenantName = getTenantFromDn(inbMo.dn)
         mgmtPName = getMgmtPFromDn(inbMo.dn)
         inbName = getNameFromDn(inbMo.dn)
         perEpgConfig = node.mit.polUni()
+        cleanupNeeded = False
         for child in inbMo.Children:
             if child.ClassName in ("fvRsProv", "fvRsCons", "fvRsConsIf"):
                 for grandchild in child.Children:
                     if grandchild.ClassName == "tagAnnotation" \
                         and grandchild.key == migrationAnnotateKey \
                         and grandchild.value == migrationAnnotateVal:
+                        cleanupNeeded = True
                         if child.ClassName == "fvRsProv":
                             for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvRsProv(tnVzBrCPName=child.tnVzBrCPName, status='deleted')
@@ -4123,6 +4218,38 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                             cleanupContractIfs.setdefault(child.tDn, set()).add(buildReverseRelation(inbMo.dn, child.tDn, 'fvRsConsIf'))
                         break
 
+        if cleanupNeeded:
+            for child in inbMo.Children:
+                if child.ClassName == 'fvSubnet':
+                    scopeFlags = [flag.strip() for flag in child.scope.split(",")]
+                    if "shared" in scopeFlags:
+                        bdSubnetDn = bdDn + "/subnet-[{}]".format(child.ip)
+                        bdSubnetSubtree = node.mit.FromDn(bdSubnetDn).GET()
+
+                        # Check if BD subnet is of special type (NLB, Anycast, Reachability)
+                        reason = "it does not exist in BD"
+                        for subnetChild in child.Children:
+                            if subnetChild.ClassName in ['fvEpNlb', 'fvEpAnycast', 'fvEpReachability']:
+                                reason = "it rappresent a{} {} endpoint"\
+                                    .format("n" if subnetChild.ClassName in ['fvEpNlb', 'fvEpAnycast'] else "",\
+                                            subnetChild.ClassName.replace('fvEp', ''))
+                                bdSubnetSubtree = None
+                                break
+
+                        # If BD subnet does not exist or EPG Subnet is a special type (NLB, Anycast, Reachability)
+                        # then just remove shared scope instead of deleting the subnet
+                        if not bdSubnetSubtree or len(bdSubnetSubtree) == 0:
+                            scopeFlags.remove("shared")
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
+                                subnet = config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvSubnet(ip=child.ip, scope=",".join(scopeFlags))
+                                subnet.xmlcomment = "Subnet not deleted since {}. Remove shared scope".format(reason)
+                        else:
+                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
+                                config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvSubnet(ip=child.ip, status='deleted')
+
+
+
+
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
             cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToNameStr(inbMo.dn), colored(inbMo.dn)), 'config': perEpgConfig})
 
@@ -4131,7 +4258,8 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
     fvESgMos = findClassInstancesWithTag('fvESg', migrationAnnotateKey, migrationAnnotateVal, skipConfigIssues=True)
     for fvESgMo in fvESgMos:
         esgDn = fvESgMo.dn
-        params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all'}
+        params = {'rsp-subtree': 'full', 'rsp-prop-include': 'all',
+                  'rsp-subtree-class': 'fvRsScope,fvRsProv,fvRsCons,fvRsConsIf,tagAnnotation'}
         fvESgSubtree = callApiWithRetry(node, node.mit.FromDn(esgDn).GET, **params)
         if not fvESgSubtree or len(fvESgSubtree) == 0:
             continue
@@ -4740,6 +4868,7 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     vrfsInYaml = {"conversion": set(), "leakTo": set()}
     esgToVrfMap = {}
     perVrfPreExistingEsgMap = {}
+    existingVrfWithEsgEnabled = set()
     if not validateInputYamlData(esgDataFromYaml, vrfsInYaml, esgToVrfMap):
         logger.error("YAML file validation: FAIL")
         sys.exit(1)
@@ -4762,7 +4891,7 @@ The generated configuration can be saved in XML or JSON format using the --outpu
     tcamOptimizedMode = True if fabricDescriptor['numVrfConversionCritical'] or fabricDescriptor['numVrfConversionWarning'] else False
 
     # Validate existing ESG to VRF mapping
-    if validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap) != ReturnCode.SUCCESS:
+    if validateESgToVrf(node, vrfsInYaml, esgToVrfMap, perVrfPreExistingEsgMap, existingVrfWithEsgEnabled) != ReturnCode.SUCCESS:
         logger.error("ESG to VRF mapping validation failed, aborting conversion")
         sys.exit(1)
 
@@ -4780,6 +4909,24 @@ The generated configuration can be saved in XML or JSON format using the --outpu
         logger.error("There {} {} pending transaction{}. Please wait for completion before running conversion phase."
                     .format("are" if transactions > 1 else "is", transactions, "s" if transactions > 1 else ""))
         sys.exit(1)
+
+    vrfSharedCountAfterConversionFailure = False
+    for nodeId in sorted(fabricDescriptor['nodeInfo'].keys(), key=int):
+        vrfSharedCountAfterConversion = 0
+        for vrf in fabricDescriptor['nodeInfo'][nodeId]['vrfDeployed']:
+            if vrf in existingVrfWithEsgEnabled:
+                vrfSharedCountAfterConversion += 1
+            elif vrf in vrfsInYaml["conversion"]:
+                vrfSharedCountAfterConversion += 1
+        if vrfSharedCountAfterConversion >= 1000:
+            logger.critical(f"Cannot migrate EPGs on node {nodeId} since VRF shared count after conversion will be {vrfSharedCountAfterConversion}. ")
+            vrfSharedCountAfterConversionFailure = True
+    if vrfSharedCountAfterConversionFailure:
+        if applyConfig:
+            logger.critical("Aborting conversion. Please reduce the number of migrated VRFs to avoid exceeding VRF shared count limits (1000).")
+            sys.exit(1)
+        else:
+            logger.warning("Continue conversion since --noConfig option is used and no config is pushed to APIC.")
 
     # Create config snapshot before doing conversion
     snapshotName = TOOL_NAME_STR + "_Preconversion_Config"

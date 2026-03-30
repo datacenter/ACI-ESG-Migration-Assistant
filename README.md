@@ -63,8 +63,8 @@ options:
   --vrfdns VRFDNS       Filter the analysis to the specified VRFs. Provide a comma-separated list of VRF DNs (no spaces).
                         Example: uni/tn-T1/ctx-ctx1,uni/tn-T2/ctx-ctx2. May be combined with other filters; all filters apply using UNION logic.
   --tenantRegex TENANTREGEX
-                        Filter by tenant name. Provide a comma-separated list of names or regex (no spaces).
-                        Example: T1,T2,Prod.*,Test[0-9]+. May be combined with other filters; all filters apply using UNION logic.
+                        Filter by tenant name. Provide a comma-separated list of names or regex (no spaces). Wrap the tenantRegex with quotes.
+                        Example: "T1,T2,Prod.*,Test[0-9]+". May be combined with other filters; all filters apply using UNION logic.
   --outYaml OUTYAML     YAML file in which we report the execution plan
   --prefix PREFIX       Prefix to add to cloned names (default: empty). Example: contract name is "web" and prefix is "e", cloned contract will be named "e_web"
   --suffix SUFFIX       Suffix to add to cloned names (default: e). Example: contract name is "web" and suffix is "e", cloned contract will be named "web_e"

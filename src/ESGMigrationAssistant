@@ -33,6 +33,10 @@ else
     echo "Executing from APIC"
 fi
 
+if [[ $# -eq 0 ]]; then
+    set -- --help
+fi
+
 if [[ ${runningFromAPIC} -eq 0 ]]; then
     pythonVersion="3.12"
     pythonCmd="python${pythonVersion}"
@@ -47,6 +51,7 @@ if [[ ${runningFromAPIC} -eq 0 ]]; then
     ${pythonToInvoke} ${rootdir}/ESGMigrationAssistant.py "$@"
     exit $?
 fi
+
 cd ${rootdir}
 /opt/cisco/system-venv3/bin/python3 ${rootdir}/ESGMigrationAssistant.py --fromApic "$@"
 exit $?
