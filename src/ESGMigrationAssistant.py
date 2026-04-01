@@ -1296,7 +1296,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                             continue
                         for acceptedSubnet in externalSubnets:
                             if ip == acceptedSubnet[0]:
-                                logger.error("Aborting analysis:\nExternal EPG {} and External EPG {} in VRF {} are mathing the same l3extSubnet {}.\nThis configuration is not supported in ESG since duplicate external subnet selectors in the same VRF are not allowed."
+                                logger.error("Aborting analysis:\nExternal EPG {} and External EPG {} in VRF {} are matching the same l3extSubnet {}.\nThis configuration is not supported in ESG since duplicate external subnet selectors in the same VRF are not allowed."
                                              .format(colored(epgDn), colored(extEpg), colored(epgDescriptor['vrf']), colored(ip)))
                                 sys.exit(1)
                 externalSubnetLayout[epgDescriptor['vrf']][epgDn] = epgDescriptor['externalSubnets']
@@ -3225,7 +3225,15 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
         return rc
 
-    def createEsgSelectors():
+    instPSelectorsDeletePatch = node.mit.polUni()
+    def applyPostEsgSelectorsPatch():
+        if applyConfig and len(list(instPSelectorsDeletePatch.Children)):
+            try:
+                callApiWithRetry(node, instPSelectorsDeletePatch.POST, format='xml')
+            except Exception as e:
+                pass
+
+    def createEsgSelectors(migrateDefaultVrfs = False):
         """
         Nested helper function
         Add EPG and External EPG selectors to input ESG, one per iteration
@@ -3325,70 +3333,77 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 epgToNodeToPcTag.setdefault(vlanCktEpMo.epgDn, {})[vlanCktEpMo.dn] = int(vlanCktEpMo.pcTag)
 
         esgConfigs = {}
-        instPSelectorsConfigPatch = node.mit.polUni()
-        instPSelectorsDeletePatch = node.mit.polUni()
+        instPSelectorsConfigPatch = {}
         for vrfData in sorted(esgDataForXml['vrfs'], key=lambda x: x['vrf']):
             vrfDn = vrfData['vrf']
+            if migrateDefaultVrfs:
+                if vrfDn not in vrfsWithDefaultExtSubnetOnly:
+                    continue
+            else:
+                if vrfDn in vrfsWithDefaultExtSubnetOnly:
+                    continue
+            instPSelectorsConfigPatch[vrfDn] = node.mit.polUni()
             esgConfigs.setdefault(vrfDn, {'perEsgConfigs': [], 'vrf': node.mit.polUni()})
             seg = vrfToSeg.get(vrfDn, 0)
 
             # Collect the per EPG and External Subnet selector configs first
-            for esg in sorted(vrfData.get('esgs', []), key=lambda x: x['name']):
-                esgName = esg['name']
-                apName = esg['applicationProfile']
-                tenantName = getTenantFromDn(esg['epgs'][0]) if esg['epgs'] else getTenantFromDn(vrfDn)
+            for collectESgWithDefaultExtSubnetOnly in [False, True]:
+                for esg in sorted(vrfData.get('esgs', []), key=lambda x: x['name']):
+                    esgName = esg['name']
+                    apName = esg['applicationProfile']
+                    tenantName = getTenantFromDn(esg['epgs'][0]) if esg['epgs'] else getTenantFromDn(vrfDn)
 
-                esgDn = f"uni/tn-{tenantName}/ap-{apName}/esg-{esgName}"
-                epgs = esg.get('epgs', [])
-                externalSubnets = esg.get('externalSubnets', [])
+                    esgDn = f"uni/tn-{tenantName}/ap-{apName}/esg-{esgName}"
+                    if collectESgWithDefaultExtSubnetOnly:
+                        if esgDn not in esgsWithDefaultExtSubnetOnly:
+                            continue
+                    else:
+                        if esgDn in esgsWithDefaultExtSubnetOnly:
+                            continue
 
-                for epg in sorted(epgs):
-                    if isValidDn(epg, ['uni', 'tn-', 'out-', 'instP-']):
-                        instPSelectorsConfigPatch.fvTenant(tenantName).fvAp(apName)\
-                            .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg)\
-                            .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
-                        instPSelectorsDeletePatch.fvTenant(tenantName).fvAp(apName)\
-                            .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg, status="deleted")
+                    epgs = esg.get('epgs', [])
+                    externalSubnets = esg.get('externalSubnets', [])
 
-                    elif isValidDn(epg, ['uni', 'tn-', 'ap-', 'epg-']):
-                        perEpgSelectorConfig = node.mit.polUni()
-                        for config in [perEpgSelectorConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
-                            tagAnnConfig = config.fvTenant(tenantName).fvAp(apName)\
-                                        .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg)\
-                                        .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
-                            tagAnnConfig.xmlcomment = "tagAnnotation used to mark EPG selectors for ESG migration cleanup"
-                        logText = "On ESG {} assign EPG {} via EPG selector".format(colored(esgName), colored(epg))
-                        esgConfigs[vrfDn]['perEsgConfigs'].append({'config': perEpgSelectorConfig,
-                                          'logText': logText,
-                                          'pcTag': esgToPcTag.get(esgDn, 0),
-                                          'seg': seg,
-                                          'epg': epg,
-                                          'externalSubnets': []})
+                    for epg in sorted(epgs):
+                        if isValidDn(epg, ['uni', 'tn-', 'out-', 'instP-']):
+                            instPSelectorsConfigPatch[vrfDn].fvTenant(tenantName).fvAp(apName)\
+                                .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg)\
+                                .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                            instPSelectorsDeletePatch.fvTenant(tenantName).fvAp(apName)\
+                                .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg, status="deleted")
 
-                if externalSubnets:
-                    perExtSubSelectorConfig = node.mit.polUni()
-                    for subnet in externalSubnets:
-                        for config in [perExtSubSelectorConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
-                            tagAnnConfig = config.fvTenant(tenantName).fvAp(apName)\
-                                        .fvESg(name=esgName)\
-                                        .fvExternalSubnetSelector(ip=subnet['ip'], shared="yes" if subnet['scope'] == 'public' else "no")\
-                                        .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
-                            tagAnnConfig.xmlcomment = "tagAnnotation used to mark External Subnet selectors for ESG migration cleanup"
+                        elif isValidDn(epg, ['uni', 'tn-', 'ap-', 'epg-']):
+                            perEpgSelectorConfig = node.mit.polUni()
+                            for config in [perEpgSelectorConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
+                                tagAnnConfig = config.fvTenant(tenantName).fvAp(apName)\
+                                            .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg)\
+                                            .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                                tagAnnConfig.xmlcomment = "tagAnnotation used to mark EPG selectors for ESG migration cleanup"
+                            logText = "On ESG {} assign EPG {} via EPG selector".format(colored(esgName), colored(epg))
+                            esgConfigs[vrfDn]['perEsgConfigs'].append({'config': perEpgSelectorConfig,
+                                            'logText': logText,
+                                            'pcTag': esgToPcTag.get(esgDn, 0),
+                                            'seg': seg,
+                                            'epg': epg,
+                                            'externalSubnets': []})
 
-                    logText = "On ESG {} assign External EPG Subnet{} via External Subnet selector".format(colored(esgName), 's' if len(externalSubnets) > 1 else '')
-                    esgConfigs[vrfDn]['perEsgConfigs'].append({'config': perExtSubSelectorConfig,
-                                      'logText': logText,
-                                      'pcTag': esgToPcTag.get(esgDn, 0),
-                                      'seg': seg,
-                                      'epg': None,
-                                      'externalSubnets': externalSubnets})
+                    if externalSubnets:
+                        perExtSubSelectorConfig = node.mit.polUni()
+                        for subnet in externalSubnets:
+                            for config in [perExtSubSelectorConfig, esgConfigs[vrfDn]['vrf'], globalConfigOutputFile]:
+                                tagAnnConfig = config.fvTenant(tenantName).fvAp(apName)\
+                                            .fvESg(name=esgName)\
+                                            .fvExternalSubnetSelector(ip=subnet['ip'], shared="yes" if subnet['scope'] == 'public' else "no")\
+                                            .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                                tagAnnConfig.xmlcomment = "tagAnnotation used to mark External Subnet selectors for ESG migration cleanup"
 
-        # Post Temporary External EPG selector config to minimize the traffic impact
-        if applyConfig and len(list(instPSelectorsConfigPatch.Children)):
-            try:
-                callApiWithRetry(node, instPSelectorsConfigPatch.POST, format='xml')
-            except Exception as e:
-                pass
+                        logText = "On ESG {} assign External EPG Subnet{} via External Subnet selector".format(colored(esgName), 's' if len(externalSubnets) > 1 else '')
+                        esgConfigs[vrfDn]['perEsgConfigs'].append({'config': perExtSubSelectorConfig,
+                                        'logText': logText,
+                                        'pcTag': esgToPcTag.get(esgDn, 0),
+                                        'seg': seg,
+                                        'epg': None,
+                                        'externalSubnets': externalSubnets})
 
         # Post EPG and External Subnet selector configs for ESGs. If in interactive mode,
         # post per ESG config one by one.
@@ -3399,6 +3414,13 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 step['total'] += len(esgConfigs[vrfDn]['perEsgConfigs']) if configStrategy == ConfigStrategy.INTERACTIVE else 1
 
         for vrfDn in esgConfigs:
+            # Post Temporary External EPG selector config to minimize the traffic impact
+            if applyConfig and len(list(instPSelectorsConfigPatch[vrfDn].Children)):
+                try:
+                    callApiWithRetry(node, instPSelectorsConfigPatch[vrfDn].POST, format='xml')
+                except Exception as e:
+                    pass
+
             somethingToConfigure = len(esgConfigs[vrfDn]['perEsgConfigs']) > 0
             while somethingToConfigure:
                 if not inputHandler.isYesToAll() and configStrategy == ConfigStrategy.INTERACTIVE:
@@ -3471,13 +3493,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                         epgSelOnSuccess(None)
                     somethingToConfigure = False # Exit while loop since all processed at once
                     rc |= allRc
-
-        # Post Delete of External EPG selector config used to minimize the traffic impact
-        if applyConfig and len(list(instPSelectorsDeletePatch.Children)):
-            try:
-                callApiWithRetry(node, instPSelectorsDeletePatch.POST, format='xml')
-            except Exception as e:
-                pass
 
         return rc
 
@@ -3602,6 +3617,30 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                             toVrfDn = grandChild.toCtxDn
                             returnData[vrfDn].setdefault(toVrfDn, []).append(network)
         return returnData
+
+    def calculatevrfsWithDefaultExtSubnetOnly():
+        vrfsWithDefaultExtSubnetOnly = set()
+        esgsWithDefaultExtSubnetOnly = set()
+        for vrf in sorted(esgDataForXml['vrfs'], key=lambda x: x['vrf']):
+            vrfDn = vrf['vrf']
+            for esg in vrf.get('esgs', []):
+                foundDefaultSubnet = False
+                foundOtherSubnet = False
+                esgName = esg['name']
+                apName = esg['applicationProfile']
+                tenantName = getTenantFromDn(esg['epgs'][0]) if esg['epgs'] else getTenantFromDn(vrfDn)
+
+                esgDn = f"uni/tn-{tenantName}/ap-{apName}/esg-{esgName}"
+                externalSubnets = esg.get('externalSubnets', [])
+                for subnet in externalSubnets:
+                    if subnet.get('ip') == '0.0.0.0/0' or subnet.get('ip') == '::/0':
+                        foundDefaultSubnet = True
+                    else:
+                        foundOtherSubnet = True
+                if foundDefaultSubnet and not foundOtherSubnet:
+                    vrfsWithDefaultExtSubnetOnly.add(vrfDn)
+                    esgsWithDefaultExtSubnetOnly.add(esgDn)
+        return vrfsWithDefaultExtSubnetOnly, esgsWithDefaultExtSubnetOnly
 
     def createEsgInbContractRelations():
         """
@@ -3836,6 +3875,7 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
     calculatePreExistingEsgContractRelations()
     preExistingLeakRoutes = calculatePreExistingLeakRoutes()
+    vrfsWithDefaultExtSubnetOnly, esgsWithDefaultExtSubnetOnly = calculatevrfsWithDefaultExtSubnetOnly()
 
     returnCode = ReturnCode.SUCCESS
     logger.info(colored("----------------------------------------------------", bold=True))
@@ -3867,9 +3907,14 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     logger.info(colored("----------------------------------------------------------", bold=True))
 
     if tcamOptimizedMode:
-        returnCode |= createEsgSelectors()
+        returnCode |= createEsgSelectors(migrateDefaultVrfs = False)
         inputHandler.reset()
     else:
+        # Clone PBR contexts and attach to the new ESG Contracts
+        returnCode |= createEsgPbrCtx()
+        inputHandler.reset()
+
+        # Attach contracts to ESGs
         returnCode |= createEsgContractRelations()
         inputHandler.reset()
 
@@ -3879,10 +3924,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
         # Attach vzAny to the new ESG contracts
         returnCode |= createEsgVzAnyContractRelations()
-        inputHandler.reset()
-
-        # Clone PBR contexts and attach to the new ESG Contracts
-        returnCode |= createEsgPbrCtx()
         inputHandler.reset()
 
     if applyConfig:
@@ -3897,6 +3938,11 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
     logger.info(colored("----------------------------------------------------------", bold=True))
 
     if tcamOptimizedMode:
+        # Clone PBR contexts and attach to the new ESG Contracts
+        returnCode |= createEsgPbrCtx()
+        inputHandler.reset()
+
+        # Attach contracts to ESGs
         returnCode |= createEsgContractRelations()
         inputHandler.reset()
 
@@ -3907,13 +3953,21 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
         # Attach vzAny to the new ESG contracts
         returnCode |= createEsgVzAnyContractRelations()
         inputHandler.reset()
-
-        # Clone PBR contexts and attach to the new ESG Contracts
-        returnCode |= createEsgPbrCtx()
-        inputHandler.reset()
     else:
-        returnCode |= createEsgSelectors()
+        returnCode |= createEsgSelectors(migrateDefaultVrfs = False)
         inputHandler.reset()
+
+    if vrfsWithDefaultExtSubnetOnly:
+        # VRFs that include ESGs with only default external subnet selector needs to be migrated last
+        logger.info(colored("----------------------------------------------------------", bold=True))
+        logger.info(colored("Configuration phase 4: Migrating VRFs that include ESGs", bold=True))
+        logger.info(colored("with only external subnet selector for default subnets", bold=True))
+        logger.info(colored("----------------------------------------------------------", bold=True))
+        returnCode |= createEsgSelectors(migrateDefaultVrfs = True)
+        inputHandler.reset()
+
+    # Apply Delete of External EPG selector config used to minimize the traffic impact
+    applyPostEsgSelectorsPatch()
 
     if applyConfig:
         tcamCapacityCheck(node, fabricDescriptor['nodeInfo'])
@@ -4225,30 +4279,19 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                     if "shared" in scopeFlags:
                         bdSubnetDn = bdDn + "/subnet-[{}]".format(child.ip)
                         bdSubnetSubtree = node.mit.FromDn(bdSubnetDn).GET()
-
-                        # Check if BD subnet is of special type (NLB, Anycast, Reachability)
-                        reason = "it does not exist in BD"
                         for subnetChild in child.Children:
                             if subnetChild.ClassName in ['fvEpNlb', 'fvEpAnycast', 'fvEpReachability']:
-                                reason = "it rappresent a{} {} endpoint"\
-                                    .format("n" if subnetChild.ClassName in ['fvEpNlb', 'fvEpAnycast'] else "",\
-                                            subnetChild.ClassName.replace('fvEp', ''))
                                 bdSubnetSubtree = None
                                 break
 
                         # If BD subnet does not exist or EPG Subnet is a special type (NLB, Anycast, Reachability)
-                        # then just remove shared scope instead of deleting the subnet
+                        # then do not touch the inband EPG subnet
                         if not bdSubnetSubtree or len(bdSubnetSubtree) == 0:
-                            scopeFlags.remove("shared")
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
-                                subnet = config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvSubnet(ip=child.ip, scope=",".join(scopeFlags))
-                                subnet.xmlcomment = "Subnet not deleted since {}. Remove shared scope".format(reason)
+                            # In case of inband EPG, if there is no BD subnet, do not do anything
+                            pass
                         else:
                             for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvSubnet(ip=child.ip, status='deleted')
-
-
-
 
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
             cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToNameStr(inbMo.dn), colored(inbMo.dn)), 'config': perEpgConfig})
