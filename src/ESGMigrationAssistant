@@ -41,12 +41,31 @@ if [[ ${runningFromAPIC} -eq 0 ]]; then
     pythonVersion="3.12"
     pythonCmd="python${pythonVersion}"
     defaultPythonFallBack="/vol/apicbin/gmeo/utils/bin/${pythonCmd}"
-    pythonToInvoke=$(type -P ${pythonCmd})
-    if [[ ! -x ${pythonToInvoke} ]]; then
-        pythonToInvoke=${defaultPythonFallBack}
+
+    # 1. Try python3.12 from PATH
+    pythonToInvoke=$(type -P "${pythonCmd}" 2>/dev/null)
+    # 2. Fallback to default path
+    if [[ ! -x "${pythonToInvoke}" ]]; then
+        if [[ -x "${defaultPythonFallBack}" ]]; then
+            pythonToInvoke="${defaultPythonFallBack}"
+        fi
     fi
-    if [[ ! -x ${pythonToInvoke} ]]; then
-        prematureExit "Cannot find ${pythonCmd} anywhere, and i need it"
+    # 3. Try python3 if version >= 3.12
+    if [[ ! -x "${pythonToInvoke}" ]]; then
+        python3Path=$(type -P python3 2>/dev/null)
+        if [[ -x "${python3Path}" ]]; then
+            pyVersion=$("${python3Path}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+            pyMajor=$(echo "${pyVersion}" | cut -d. -f1)
+            pyMinor=$(echo "${pyVersion}" | cut -d. -f2)
+
+            if [[ "${pyMajor}" -eq 3 && "${pyMinor}" -ge 12 ]]; then
+                pythonToInvoke="${python3Path}"
+            fi
+        fi
+    fi
+
+    if [[ ! -x "${pythonToInvoke}" ]]; then
+        prematureExit "Cannot find python3.12 or a compatible python3 (>=3.12) anywhere, and i need it"
     fi
     ${pythonToInvoke} ${rootdir}/ESGMigrationAssistant.py "$@"
     exit $?
