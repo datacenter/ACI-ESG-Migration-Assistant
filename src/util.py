@@ -7,7 +7,6 @@ import functools
 import logging
 import pyaci
 from xml import etree
-import pytz
 import threading
 import itertools
 import time
@@ -208,22 +207,6 @@ def makeDn(classID, tenantName, name):
         return "uni/tn-{}/flt-{}".format(tenantName, name)
     else:
         reportAFailure("Unsupported classID: {}".format(classID))
-
-def tzAware(dt):
-    """
-    Check if a time object is tz aware or no
-    """
-    return dt.tzinfo is not None and dt.tzinfo.utcoffset(dt) is not None
-
-
-def makeTzAware(dt):
-    """
-    Make a timestamp TZ aware assuming UTC
-    """
-    if not tzAware(dt):
-        return dt.replace(tzinfo=pytz.utc)
-    return dt
-
 
 def tree():
     """

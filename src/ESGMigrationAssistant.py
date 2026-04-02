@@ -1177,7 +1177,6 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
             'appProfileName': getNameFromDn(epgMo.Parent.Dn),
             'ignoreMigration': epgDn in epgsAssignedToSelector,
             'unsupportedFeatures': epgsWithUnsupportedFeatures[epgDn] if epgDn in epgsWithUnsupportedFeatures else set(),
-            'inbOrVzany': epgMo.ClassName in ("mgmtInB", "vzAny"),
             'isUseg': epgMo.ClassName == "fvAEPg" and epgMo.getProp("isAttrBasedEPg") == "yes",
             'externalSubnets': [],
             'leakInternalSubnetsFromProv': [],
@@ -1367,7 +1366,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
             leakExternalPrefixes.update(epgData['leakExternalPrefixes'])
         if mode == 'optimized' and \
            not epgData['isUseg'] and \
-           not epgData['inbOrVzany']:
+           not epgData['className'] in ("mgmtInB", "vzAny", "fvESg"):
             for otherEpgDn, otherEpgData in epgLayout.items():
                 if (otherEpgData['ignoreMigration']) or \
                    (otherEpgDn in visitedEpgs) or \
@@ -1400,7 +1399,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                         leakExternalPrefixes.update(otherEpgData['leakExternalPrefixes'])
                     visitedEpgs.add(otherEpgDn)
 
-        if epgData['inbOrVzany'] or epgData['className'] == "fvESg":
+        if epgData['className'] in ("mgmtInB", "vzAny", "fvESg"):
             groupCount += 1
             name = "ESG_{}_{}_{}".format(tenantName, appProfileName, groupCount)
             esgDn = epgDn
@@ -1750,6 +1749,11 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
             count = 0
             for prov in contractDnToESGMapping[contractDn]['prov']:
                 for cons in contractDnToESGMapping[contractDn]['cons']:
+                    if (prov == cons) and \
+                       (isValidDn(prov, ['uni', 'tn-', 'ctx-', 'any']) or \
+                        isValidDn(prov, ['uni', 'tn-', 'ap-', 'esg-']) or \
+                        isValidDn(prov, ['uni', 'tn-', 'mgmtp-', 'inb-'])):
+                        continue
                     count += 1
                     jsonResult['contractClones'].append(
                         {'cloneName': namePrefix + contractName + nameSuffix + '_' + str(count),
