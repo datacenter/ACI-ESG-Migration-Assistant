@@ -964,11 +964,10 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     bdToSharedSubnet = {}
     outToCtx = {}
     cpIfToContract = {}
-    brCPToConsumer = {}
-    brCPToProvider = {}
+    contractProvConsLayout = {}
     vzAnyPrefGrMembrship = {}
     epgsAssignedToSelector = set()
-    vrfVzAnyContractLayout = {}
+    vrfVzAnycontractProvConsLayout = {}
     epgsWithUnsupportedFeatures = {}
     contractsWithUnsupportedFeatures = {}
     perVrfExternalSubnetSelectors = {}
@@ -1034,6 +1033,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
         for vzBrCPDn, vzBrCPMo in iter:
             targetProvEpgDns = set()
             targetConsEpgDns = set()
+            targetIntraEpgDns = set()
             for childMo in vzBrCPMo.Children:
                 if childMo.ClassName == "vzRtProv":
                     targetEpgDn = childMo.getProp('tDn')
@@ -1043,6 +1043,10 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                     targetEpgDn = childMo.getProp('tDn')
                     if targetEpgDn:
                         targetConsEpgDns.add(targetEpgDn)
+                if childMo.ClassName == "vzRtIntraEpg":
+                    targetEpgDn = childMo.getProp('tDn')
+                    if targetEpgDn:
+                        targetIntraEpgDns.add(targetEpgDn)
                 elif childMo.ClassName == "vzRtIf":
                     targetIfDn = childMo.getProp('tDn')
                     if targetIfDn:
@@ -1057,22 +1061,22 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                                 if targetEpgDn:
                                     targetConsEpgDns.add(targetEpgDn)
                                     vrfDn = targetEpgDn.rsplit('/', 1)[0]
-                                    vrfVzAnyContractLayout.setdefault(vrfDn, {"providers": set(), "consumers": set()})
-                                    vrfVzAnyContractLayout[vrfDn]["consumers"].add(vzBrCPDn)
+                                    vrfVzAnycontractProvConsLayout.setdefault(vrfDn, {"providers": set(), "consumers": set()})
+                                    vrfVzAnycontractProvConsLayout[vrfDn]["consumers"].add(vzBrCPDn)
                 elif childMo.ClassName == "vzRtAnyToProv":
                     targetEpgDn = childMo.getProp('tDn')
                     if targetEpgDn:
                         targetProvEpgDns.add(targetEpgDn)
                         vrfDn = targetEpgDn.rsplit('/', 1)[0]
-                        vrfVzAnyContractLayout.setdefault(vrfDn, {"providers": set(), "consumers": set()})
-                        vrfVzAnyContractLayout[vrfDn]["providers"].add(vzBrCPDn)
+                        vrfVzAnycontractProvConsLayout.setdefault(vrfDn, {"providers": set(), "consumers": set()})
+                        vrfVzAnycontractProvConsLayout[vrfDn]["providers"].add(vzBrCPDn)
                 elif childMo.ClassName == "vzRtAnyToCons":
                     targetEpgDn = childMo.getProp('tDn')
                     if targetEpgDn:
                         targetConsEpgDns.add(targetEpgDn)
                         vrfDn = targetEpgDn.rsplit('/', 1)[0]
-                        vrfVzAnyContractLayout.setdefault(vrfDn, {"providers": set(), "consumers": set()})
-                        vrfVzAnyContractLayout[vrfDn]["consumers"].add(vzBrCPDn)
+                        vrfVzAnycontractProvConsLayout.setdefault(vrfDn, {"providers": set(), "consumers": set()})
+                        vrfVzAnycontractProvConsLayout[vrfDn]["consumers"].add(vzBrCPDn)
                 elif childMo.ClassName == "vzSubj":
                     contractToFilterDescriptor.setdefault(childMo.Dn, {"contractDn": vzBrCPDn, "revFltPorts": childMo.getProp('revFltPorts'), "filterDns": set()})
                     for subjChildMo in childMo.Children:
@@ -1081,13 +1085,12 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                             if filterDn:
                                 contractToFilterDescriptor[childMo.Dn]["filterDns"].add(filterDn)
 
-            brCPToProvider[vzBrCPDn] = targetProvEpgDns
-            brCPToConsumer[vzBrCPDn] = targetConsEpgDns
+            contractProvConsLayout[vzBrCPDn] = {"providers": targetProvEpgDns, "consumers": targetConsEpgDns, "intra": targetIntraEpgDns}
+
             if vzBrCPMo.getProp('scope') == 'application-profile':
                 contractsWithUnsupportedFeatures.setdefault(vzBrCPDn, set())
                 contractsWithUnsupportedFeatures[vzBrCPDn].add("Contract scope application-profile")
 
-        logger.debug("Found {} vzBrCP (contracts): {} Provider relations and {} Consumer relations".format(len(iter), sum(len(v) for v in brCPToProvider.values()), sum(len(v) for v in brCPToConsumer.values())))
     # Pre-Collect EPGs assigned to selectors
     iter = mit.lookupByClass('fvEPgSelector')
     if iter:
@@ -1101,10 +1104,12 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
         vzAnyPrefGrMembrship[vrfDn] = vzAnyMo.getProp('prefGrMemb')
 
     # Pre-Collect all Per-VRF External Subnet Selectors and extend allEpgMos to include ESGs
+    assignedESgDns = set()
     esgsMos = mit.lookupByClass('fvESg')
     if esgsMos:
         allEpgMos.extend(esgsMos)
-        for _, esgMo in esgsMos:
+        for esgDn, esgMo in esgsMos:
+            assignedESgDns.add(esgDn)
             esgExternalSubnetSelectors = set()
             esgVrfDn = None
             for mo in esgMo.Children:
@@ -1162,6 +1167,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     #
     epgLayout = {}
     externalSubnetLayout = {}
+    instPWithoutExternalSubnet = set()
     inheritedFrom = defaultdict(set)
 
     for epgDn, epgMo in allEpgMos:
@@ -1273,13 +1279,11 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                         inheritedFrom[epgDn].add(tDn)
 
             # Collect contracts from vzAny contract layout if applicable
-            if epgDescriptor['vrf'] in vrfVzAnyContractLayout:
-                for contract in vrfVzAnyContractLayout[epgDescriptor['vrf']]["providers"]:
+            if epgDescriptor['vrf'] in vrfVzAnycontractProvConsLayout:
+                for contract in vrfVzAnycontractProvConsLayout[epgDescriptor['vrf']]["providers"]:
                     epgDescriptor['contracts'].add("{}:{}".format("vzanyprov", contract))
-                for contract in vrfVzAnyContractLayout[epgDescriptor['vrf']]["consumers"]:
+                for contract in vrfVzAnycontractProvConsLayout[epgDescriptor['vrf']]["consumers"]:
                     epgDescriptor['contracts'].add("{}:{}".format("vzanycons", contract))
-
-            epgLayout[epgDn] = epgDescriptor
 
             if noFiltersUsed or epgDescriptor['vrf'] in aggregateFilterVrfDns:
                 externalSubnetLayout.setdefault(epgDescriptor['vrf'], {'__ipv4Default__$': False, '__ipv6Default__$': False})
@@ -1300,6 +1304,11 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                                 sys.exit(1)
                 externalSubnetLayout[epgDescriptor['vrf']][epgDn] = epgDescriptor['externalSubnets']
 
+            if epgMo.ClassName == "l3extInstP" and epgDescriptor['externalSubnets'] == []:
+                instPWithoutExternalSubnet.add(epgDn)
+
+            epgLayout[epgDn] = epgDescriptor
+
         else:
             tenantName = getTenantFromDn(epgDn)
             if tenantsInvolved:
@@ -1312,6 +1321,21 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
 
     for epgDn, masterDns in inheritedFrom.items():
         processInheritedContracts(epgDn, masterDns)
+
+    contractsNotNeededMigration = set()
+    for vzBrCPDn in contractProvConsLayout.keys():
+            contractsNeededMigration = False
+            provConsSet = contractProvConsLayout[vzBrCPDn]['providers']
+            provConsSet = provConsSet.union(contractProvConsLayout[vzBrCPDn]['consumers'])
+            provConsSet = provConsSet.union(contractProvConsLayout[vzBrCPDn]['intra'])
+            for epgDn in provConsSet:
+                if isValidDn(epgDn, ['uni', 'tn-', 'ap-', 'epg-']) or isValidDn(epgDn, ['uni', 'tn-', 'out-', 'instP-']):
+                    if epgDn in epgLayout and not epgLayout[epgDn]['ignoreMigration'] and epgDn not in instPWithoutExternalSubnet:
+                        contractsNeededMigration = True
+                        break
+
+            if not contractsNeededMigration:
+                contractsNotNeededMigration.add(vzBrCPDn)
 
     #
     # Step 4: Group similar EPGs into the same ESG. EPGs are considered similar when they have the same
@@ -1329,8 +1353,9 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
     for epgDn, epgData in sorted(epgLayout.items()):
         vrfDn = epgData['vrf']
         if (epgData['ignoreMigration']) or \
-           (not epgData['contracts'] and vrfDn not in vrfVzAnyContractLayout) or \
+           (not epgData['contracts'] and vrfDn not in vrfVzAnycontractProvConsLayout) or \
            (filtersUsed and vrfDn not in aggregateFilterVrfDns) or \
+           (epgDn in instPWithoutExternalSubnet) or \
            (epgDn in visitedEpgs):
             if not spinner.isRunning():
                 spinner.text = "Analyzing EPGs"
@@ -1369,6 +1394,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
            not epgData['className'] in ("mgmtInB", "vzAny", "fvESg"):
             for otherEpgDn, otherEpgData in epgLayout.items():
                 if (otherEpgData['ignoreMigration']) or \
+                   (otherEpgDn in instPWithoutExternalSubnet) or \
                    (otherEpgDn in visitedEpgs) or \
                    (otherEpgData['unsupportedFeatures']):
                     continue
@@ -1417,6 +1443,11 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 groupCount += 1
                 name = "ESG_{}_{}_{}".format(tenantName, appProfileName, groupCount)
             esgDn = "uni/tn-{}/ap-{}/esg-{}".format(tenantName, appProfileName, name)
+            while esgDn in assignedESgDns:
+                groupCount += 1
+                name = "ESG_{}_{}_{}".format(tenantName, appProfileName, groupCount)
+                esgDn = "uni/tn-{}/ap-{}/esg-{}".format(tenantName, appProfileName, name)
+            assignedESgDns.add(esgDn)
 
         esgProv = []
         esgCons = []
@@ -1429,6 +1460,8 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 contractDn = cpIfToContract.get(extractedDn, '')
             else:
                 contractDn = extractedDn
+            if contractDn in contractsNotNeededMigration:
+                continue
             if contractDn not in contractDnToESGMapping:
                 contractDnToESGMapping[contractDn] = {'prov': set(), 'cons': set(), 'consif': set(), 'intraepg': set()}
 
@@ -1438,7 +1471,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                     contractDnToESGMapping[contractDn]['prov'].add(esgDn)
                 # Get Target VRFs if leak subnets are present
                 if leakInternalSubnetsFromProv or leakExternalPrefixes:
-                    consumerEPGs = brCPToConsumer.get(contractDn, set())
+                    consumerEPGs = contractProvConsLayout.get(contractDn, {}).get('consumers', set())
                     for consumerEpg in consumerEPGs:
                         consumerVrfDn = epgLayout.get(consumerEpg, {}).get("vrf", None)
                         if not consumerVrfDn:
@@ -1451,7 +1484,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                     contractDnToESGMapping[contractDn]['cons'].add(esgDn)
                 # Get Target VRFs if leak subnets are present
                 if leakInternalSubnetsFromCons or leakExternalPrefixes:
-                    providerEPGs = brCPToProvider.get(contractDn, set())
+                    providerEPGs = contractProvConsLayout.get(contractDn, {}).get('providers', set())
                     for providerEpg in providerEPGs:
                         providerVrfDn = epgLayout.get(providerEpg, {}).get("vrf", None)
                         if not providerVrfDn:
@@ -1463,7 +1496,7 @@ def generateDryrunConfig(mit, mode, ndCompliant, yamlOutputFile, namePrefix, nam
                 contractDnToESGMapping[contractDn]['consif'].add((extractedDn, esgDn))
                 # Get Target VRFs if leak subnets are present
                 if leakInternalSubnetsFromCons or leakExternalPrefixes:
-                    providerEPGs = brCPToProvider.get(contractDn, set())
+                    providerEPGs = contractProvConsLayout.get(contractDn, {}).get('providers', set())
                     for providerEpg in providerEPGs:
                         providerVrfDn = epgLayout.get(providerEpg, {}).get("vrf", None)
                         if not providerVrfDn:
@@ -4251,14 +4284,12 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
         mgmtPName = getMgmtPFromDn(inbMo.dn)
         inbName = getNameFromDn(inbMo.dn)
         perEpgConfig = node.mit.polUni()
-        cleanupNeeded = False
         for child in inbMo.Children:
             if child.ClassName in ("fvRsProv", "fvRsCons", "fvRsConsIf"):
                 for grandchild in child.Children:
                     if grandchild.ClassName == "tagAnnotation" \
                         and grandchild.key == migrationAnnotateKey \
                         and grandchild.value == migrationAnnotateVal:
-                        cleanupNeeded = True
                         if child.ClassName == "fvRsProv":
                             for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
                                 config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvRsProv(tnVzBrCPName=child.tnVzBrCPName, status='deleted')
@@ -4275,27 +4306,6 @@ def generateCleanupConfig(node, outputFile, noConfig, configStrategy):
                                 config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvRsConsIf(tnVzCPIfName=child.tnVzCPIfName, status='deleted')
                             cleanupContractIfs.setdefault(child.tDn, set()).add(buildReverseRelation(inbMo.dn, child.tDn, 'fvRsConsIf'))
                         break
-
-        if cleanupNeeded:
-            for child in inbMo.Children:
-                if child.ClassName == 'fvSubnet':
-                    scopeFlags = [flag.strip() for flag in child.scope.split(",")]
-                    if "shared" in scopeFlags:
-                        bdSubnetDn = bdDn + "/subnet-[{}]".format(child.ip)
-                        bdSubnetSubtree = node.mit.FromDn(bdSubnetDn).GET()
-                        for subnetChild in child.Children:
-                            if subnetChild.ClassName in ['fvEpNlb', 'fvEpAnycast', 'fvEpReachability']:
-                                bdSubnetSubtree = None
-                                break
-
-                        # If BD subnet does not exist or EPG Subnet is a special type (NLB, Anycast, Reachability)
-                        # then do not touch the inband EPG subnet
-                        if not bdSubnetSubtree or len(bdSubnetSubtree) == 0:
-                            # In case of inband EPG, if there is no BD subnet, do not do anything
-                            pass
-                        else:
-                            for config in [perEpgConfig, perVrfConfigToPost[vrfDn], globalConfigToPost, globalConfigOutputFile]:
-                                config.fvTenant(tenantName).mgmtMgmtP(mgmtPName).mgmtInB(inbName).fvSubnet(ip=child.ip, status='deleted')
 
         if configStrategy == ConfigStrategy.INTERACTIVE and len(list(perEpgConfig.Children)):
             cleanupSequence.append({'text': "Cleaning up security on {} {}".format(epgDnToNameStr(inbMo.dn), colored(inbMo.dn)), 'config': perEpgConfig})
@@ -4877,6 +4887,9 @@ Two conversion configuration strategies are supported:
   - VRF-based: all EPGs and External EPGs within the same VRF are migrated in a single transaction.
 
 The generated configuration can be saved in XML or JSON format using the --outputFile option.
+
+WARNING - Temporary health score drop and faults might be seen during migration.
+          These faults should be resolved by the end of cleanup phase.
 """)
 
     class LineNumberLoader(yaml.SafeLoader):
