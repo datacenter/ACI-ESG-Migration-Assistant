@@ -2496,6 +2496,92 @@ def tcamCapacityCheck(node, nodeInfo):
                     nodeInfo[nodeId]['tcamUsage'],
                     nodeInfo[nodeId]['tcamCapacity']))
 
+def sharedVrfCapacity(node, nodeInfo):
+    logger = logging.getLogger(globalValues['logger'])
+
+    spinner.text = "Checking Shared VRF usage"
+
+    result = node.methods.ResolveClass('eqptcapacitySharedVrfUsage5min').GET()
+    for mo in result:
+        nodeId = getNodeIdFromDn(mo.dn)
+        if nodeId and nodeId in nodeInfo:
+            nodeInfo[nodeId]['sharedVrfUsage'] = int(mo.totalLast)
+            nodeInfo[nodeId]['sharedVrfTotal'] = int(mo.totalCapLast)
+            nodeInfo[nodeId]['sharedVrfUsagePercent'] = int(mo.totalLast)/int(mo.totalCapLast)*100 if int(mo.totalCapLast) > 0 else 0
+
+    logger.info("Shared VRF Usage Information:")
+    for nodeId in sorted(nodeInfo.keys(), key=int):  # sort nodeId numerically
+        if nodeInfo[nodeId]['role'] == 'leaf' and 'sharedVrfUsagePercent' in nodeInfo[nodeId]:
+            percentText = "{:.2f}%".format(nodeInfo[nodeId]['sharedVrfUsagePercent'])
+            if nodeInfo[nodeId]['sharedVrfUsagePercent'] >= 90.0:
+                percentText = colored(percentText, 'red', bold=True)
+            elif nodeInfo[nodeId]['sharedVrfUsage'] >= 50.0:
+                percentText = colored(percentText, 'magenta')
+            logger.info("Node {} pod {} - Shared VRF usage on {} ({}) is {} ({}/{})".
+                format(nodeId,
+                    nodeInfo[nodeId]['podId'],
+                    nodeInfo[nodeId]['name'],
+                    nodeInfo[nodeId]['model'],
+                    percentText,
+                    nodeInfo[nodeId]['sharedVrfUsage'],
+                    nodeInfo[nodeId]['sharedVrfTotal']))
+
+def sharedVrfCapacityCheck(node, nodeInfo, vrfsInYaml):
+    logger = logging.getLogger(globalValues['logger'])
+
+    sharedVrfCapacity(node, nodeInfo)
+
+    # Initial check based on current shared VRF usage and worst case estimation of conversion impact
+    vrfSharedCountAfterConversionFailure = False
+    for nodeId in nodeInfo:
+        if nodeInfo[nodeId]['role'] == 'leaf':
+            vrfConversionNodeCount = nodeInfo[nodeId]['sharedVrfUsage']
+            for vrf in vrfsInYaml["conversion"]:
+                if vrf in nodeInfo[nodeId]['vrfDeployed']:
+                    # Assume worst case of both ipv4 and ipv6 addresses in the VRF for estimation purposes
+                    vrfConversionNodeCount += 2
+            if vrfConversionNodeCount > nodeInfo[nodeId]['sharedVrfTotal']:
+                vrfSharedCountAfterConversionFailure = True
+                break
+
+    if vrfSharedCountAfterConversionFailure:
+        vrfSharedCountAfterConversionFailure = False
+        ipvAddressFamily = {}
+        spinner.text = "Query IP Address Families for Shared VRF usage"
+        params = {'query-target-filter': 'and(eq(ipAddr.ctrl,"pervasive"),eq(ipAddr.type,"primary"))'}
+        result = node.methods.ResolveClass('ipAddr').GET(**params)
+        for mo in result:
+            match = re.search(r"dom-([^/]+)", mo.dn)
+            if match:
+                tenantAndVrf = match.group(1)
+                if ":" not in tenantAndVrf:
+                    continue
+                tenant, vrf = tenantAndVrf.split(":")
+                vrfDn = f"uni/tn-{tenant}/ctx-{vrf}"
+                ipvAddressFamily.setdefault(vrfDn, {'ipv4': False, 'ipv6': False})
+                ipAddr = ipaddress.ip_network(mo.addr, strict=False)
+                if ipAddr.version == 4:
+                    ipvAddressFamily[vrfDn]['ipv4'] = True
+                elif ipAddr.version == 6:
+                    ipvAddressFamily[vrfDn]['ipv6'] = True
+
+        for nodeId in sorted(nodeInfo.keys(), key=int):
+            if nodeInfo[nodeId]['role'] == 'leaf':
+                vrfConversionNodeCount = nodeInfo[nodeId]['sharedVrfUsage']
+                for vrf in vrfsInYaml["conversion"]:
+                    if vrf in nodeInfo[nodeId]['vrfDeployed']:
+                        if vrf in ipvAddressFamily:
+                            if ipvAddressFamily[vrf]['ipv4']:
+                                vrfConversionNodeCount += 1
+                            if ipvAddressFamily[vrf]['ipv6']:
+                                vrfConversionNodeCount += 1
+
+                if vrfConversionNodeCount > nodeInfo[nodeId]['sharedVrfTotal']:
+                    vrfSharedCountAfterConversionFailure = True
+                    logger.critical(f"Cannot migrate EPGs on node {nodeId} since the estimate Shared VRF usage during conversion will be {vrfConversionNodeCount}.")
+
+    return vrfSharedCountAfterConversionFailure
+
 def capacityCheck(node, fabricDescriptor, vrfConversionSet, noConfig):
     """
     Helper function to check policy Tcam utilization.
@@ -2707,8 +2793,9 @@ def dryrunConfigSnapshot(node, snapshotName):
     logger.info("There {} {} existing snapshot{} for {}:".format(
         "is" if len(configSnapshotList) == 1 else "are", len(configSnapshotList),
         "" if len(configSnapshotList) == 1 else "s", snapshotName.replace("_", " ")))
-    logger.info("Please choose one of the existing snapshots or create a new one:")
-    logger.info(f"0. Create a new snapshot file")
+    if len(configSnapshotList) > 0:
+        logger.info("Please choose one of the existing snapshots or create a new one:")
+        logger.info(f"0. Create a new snapshot file")
     for id, snap in enumerate(configSnapshotList, start=1):
         logger.info(f"{id}. {snap['file']} — created at {snap['time']}")
     print()
@@ -2716,7 +2803,10 @@ def dryrunConfigSnapshot(node, snapshotName):
     rawChoice = None
     while True:
         try:
-            rawChoice = input("Make a selection by entering a number [0-{}] or Q-Quit: ".format(len(configSnapshotList)))
+            if len(configSnapshotList) > 0:
+                rawChoice = input("Make a selection by entering a number [0-{}] or Q-Quit: ".format(len(configSnapshotList)))
+            else:
+                rawChoice = input("Make a selection by entering 0 to create a new snapshot or Q-Quit: ")
             selection = int(rawChoice)
             if 0 <= selection <= len(configSnapshotList):
                 break
@@ -2940,7 +3030,13 @@ def checkApicVersionCompatibility(node, minV=None, maxV=None):
     maxVParsed = parseAciVersion(maxV) if maxV else None
     versionCheckPassed = True
     apicsInfo = []
-    for apic in node.methods.ResolveClass('firmwareCtrlrRunning').GET():
+    try:
+         firmwareCtrlrRunning = node.methods.ResolveClass('firmwareCtrlrRunning').GET()
+    except Exception as e:
+        logger.error(f"Failed to get APIC version information: {e}")
+        logger.error("APIC version compatibility check cannot be performed, aborting conversion for safety.")
+        sys.exit(1)
+    for apic in firmwareCtrlrRunning:
         apicsInfo.append({'id': getNodeIdFromDn(apic.dn), 'version': apic.version, 'parseVersion': parseAciVersion(apic.version)})
     for apic in sorted(apicsInfo, key=lambda x: x['id']):
         logger.info(f"APIC {apic['id']} is running version {apic['version']}")
@@ -3400,12 +3496,14 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
 
                     epgs = esg.get('epgs', [])
                     externalSubnets = esg.get('externalSubnets', [])
+                    perESgInstPSelectorsConfigPatch = node.mit.polUni()
 
                     for epg in sorted(epgs):
                         if isValidDn(epg, ['uni', 'tn-', 'out-', 'instP-']):
-                            instPSelectorsConfigPatch[vrfDn].fvTenant(tenantName).fvAp(apName)\
-                                .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg)\
-                                .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
+                            for config in [perESgInstPSelectorsConfigPatch, instPSelectorsConfigPatch[vrfDn]]:
+                                config.fvTenant(tenantName).fvAp(apName)\
+                                    .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg)\
+                                    .tagAnnotation(key=migrationAnnotateKey, value=migrationAnnotateVal)
                             instPSelectorsDeletePatch.fvTenant(tenantName).fvAp(apName)\
                                 .fvESg(name=esgName).fvEPgSelector(matchEpgDn=epg, status="deleted")
 
@@ -3422,7 +3520,8 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                                             'pcTag': esgToPcTag.get(esgDn, 0),
                                             'seg': seg,
                                             'epg': epg,
-                                            'externalSubnets': []})
+                                            'externalSubnets': [],
+                                            'instPSelectorPatch': None})
 
                     if externalSubnets:
                         perExtSubSelectorConfig = node.mit.polUni()
@@ -3440,7 +3539,8 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                                         'pcTag': esgToPcTag.get(esgDn, 0),
                                         'seg': seg,
                                         'epg': None,
-                                        'externalSubnets': externalSubnets})
+                                        'externalSubnets': externalSubnets,
+                                        'instPSelectorPatch': perESgInstPSelectorsConfigPatch})
 
         # Post EPG and External Subnet selector configs for ESGs. If in interactive mode,
         # post per ESG config one by one.
@@ -3451,13 +3551,6 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                 step['total'] += len(esgConfigs[vrfDn]['perEsgConfigs']) if configStrategy == ConfigStrategy.INTERACTIVE else 1
 
         for vrfDn in esgConfigs:
-            # Post Temporary External EPG selector config to minimize the traffic impact
-            if applyConfig and len(list(instPSelectorsConfigPatch[vrfDn].Children)):
-                try:
-                    callApiWithRetry(node, instPSelectorsConfigPatch[vrfDn].POST, format='xml')
-                except Exception as e:
-                    pass
-
             somethingToConfigure = len(esgConfigs[vrfDn]['perEsgConfigs']) > 0
             while somethingToConfigure:
                 if not inputHandler.isYesToAll() and configStrategy == ConfigStrategy.INTERACTIVE:
@@ -3466,8 +3559,17 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                     epg = perEpgConfig['epg']
                     seg = perEpgConfig['seg']
                     externalSubnets = perEpgConfig['externalSubnets']
+                    instPSelectorPatch = perEpgConfig['instPSelectorPatch']
                     logger.info(perEpgConfig['logText'])
                     selRc = logAndPost(perEpgConfig['config'], step = step)
+
+                    if applyConfig and selRc == ReturnCode.SUCCESS:
+                        # Post Temporary External EPG selector config to minimize the traffic impact
+                        if instPSelectorPatch and len(list(instPSelectorPatch.Children)):
+                            try:
+                                callApiWithRetry(node, instPSelectorPatch.POST, format='xml')
+                            except Exception as e:
+                                pass
 
                     if epg:
                         if applyConfig and pcTag and selRc == ReturnCode.SUCCESS:
@@ -3500,6 +3602,13 @@ def generateConversionConfig(node, esgDataForXml, perVrfPreExistingEsgMap, outpu
                         logger.info(perEpgConfig['logText'])
                     allRc = logAndPost(esgConfigs[vrfDn]['vrf'], step = step)
                     if applyConfig and allRc == ReturnCode.SUCCESS:
+                        # Post Temporary External EPG selector config to minimize the traffic impact
+                        if len(list(instPSelectorsConfigPatch[vrfDn].Children)):
+                            try:
+                                callApiWithRetry(node, instPSelectorsConfigPatch[vrfDn].POST, format='xml')
+                            except Exception as e:
+                                pass
+
                         esgToNodeId = set()
                         for perEpgConfig in esgConfigs[vrfDn]['perEsgConfigs']:
                             pcTag = perEpgConfig['pcTag']
@@ -4890,6 +4999,10 @@ The generated configuration can be saved in XML or JSON format using the --outpu
 
 WARNING - Temporary health score drop and faults might be seen during migration.
           These faults should be resolved by the end of cleanup phase.
+WARNING - During migration, the total number of contracts might exceed the maximum recommended in the
+          Scalability Guide. However, this is expected during migration and should be resolved by the
+          end of cleanup phase. The new contracts will eventually generate the exact same rules already
+          present in the system. No additional TCAM will be consumed at the end of the conversion phase.
 """)
 
     class LineNumberLoader(yaml.SafeLoader):
@@ -4955,8 +5068,16 @@ WARNING - Temporary health score drop and faults might be seen during migration.
         logger.error("ESG to VRF mapping validation failed, aborting conversion")
         sys.exit(1)
 
-    # Pre conversion health checks:
-    # - Global PC Tag capacity
+    if sharedVrfCapacityCheck(node, fabricDescriptor['nodeInfo'], vrfsInYaml):
+        if applyConfig:
+            logger.critical("Aborting conversion. Please reduce the number of migrated VRFs to avoid exceeding Shared VRF usage limits (1000).")
+            sys.exit(1)
+        else:
+            logger.warning("Continue conversion since --noConfig option is used and no config is pushed to APIC.")
+    else:
+        logger.info("Shared VRF usage: PASS")
+
+    # Global PC Tag capacity
     if not validateGlobalPcTagCapacity(node, fabricDescriptor, esgToVrfMap):
         if applyConfig:
             logger.critical("Aborting conversion. Please free up some PC Tags or reduce the number of ESGs to configure")
@@ -4969,24 +5090,6 @@ WARNING - Temporary health score drop and faults might be seen during migration.
         logger.error("There {} {} pending transaction{}. Please wait for completion before running conversion phase."
                     .format("are" if transactions > 1 else "is", transactions, "s" if transactions > 1 else ""))
         sys.exit(1)
-
-    vrfSharedCountAfterConversionFailure = False
-    for nodeId in sorted(fabricDescriptor['nodeInfo'].keys(), key=int):
-        vrfSharedCountAfterConversion = 0
-        for vrf in fabricDescriptor['nodeInfo'][nodeId]['vrfDeployed']:
-            if vrf in existingVrfWithEsgEnabled:
-                vrfSharedCountAfterConversion += 1
-            elif vrf in vrfsInYaml["conversion"]:
-                vrfSharedCountAfterConversion += 1
-        if vrfSharedCountAfterConversion >= 1000:
-            logger.critical(f"Cannot migrate EPGs on node {nodeId} since VRF shared count after conversion will be {vrfSharedCountAfterConversion}. ")
-            vrfSharedCountAfterConversionFailure = True
-    if vrfSharedCountAfterConversionFailure:
-        if applyConfig:
-            logger.critical("Aborting conversion. Please reduce the number of migrated VRFs to avoid exceeding VRF shared count limits (1000).")
-            sys.exit(1)
-        else:
-            logger.warning("Continue conversion since --noConfig option is used and no config is pushed to APIC.")
 
     # Create config snapshot before doing conversion
     snapshotName = TOOL_NAME_STR + "_Preconversion_Config"
