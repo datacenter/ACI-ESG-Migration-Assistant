@@ -2450,7 +2450,9 @@ def tcamGetNodeInfo(node):
             nodeInfo[mo.id] = {'nodeId': int(mo.id), 'podId': podId,
                                'name':mo.name, 'role': mo.role, 'model': mo.model,
                                'scaleProfile': 'unknown',
-                               'tcamUsage': 0, 'tcamCapacity': 0, 'tcamUsagePercent': 0.0, 'vrfDeployed': set(),
+                               'tcamUsage': 0, 'tcamCapacity': 0, 'tcamUsagePercent': 0.0,
+                               'sharedVrfUsage': 0, 'sharedVrfTotal': 1000, 'sharedVrfUsagePercent': 0.0,
+                               'vrfDeployed': set(),
                                'version': version, 'versionStr': mo.version}
 
     # Get Node Scale Profile
@@ -2511,7 +2513,7 @@ def sharedVrfCapacity(node, nodeInfo):
 
     logger.info("Shared VRF Usage Information:")
     for nodeId in sorted(nodeInfo.keys(), key=int):  # sort nodeId numerically
-        if nodeInfo[nodeId]['role'] == 'leaf' and 'sharedVrfUsagePercent' in nodeInfo[nodeId]:
+        if nodeInfo[nodeId]['role'] == 'leaf':
             percentText = "{:.2f}%".format(nodeInfo[nodeId]['sharedVrfUsagePercent'])
             if nodeInfo[nodeId]['sharedVrfUsagePercent'] >= 90.0:
                 percentText = colored(percentText, 'red', bold=True)
