@@ -4,34 +4,43 @@ ACI deployment using EPG (for networking and security meaning) and to
 automate the process of moving the security portion from the EPG to
 the ESG construct.
 
-# PACKAGING
-The tool is developed using python, as such there is no build needed,
-just a packaging required. The tool is supposed to be launched
-directly from the APIC SSH console itself, but in reality can be
-launched by any place where python 3.12 mint installation is present
-and there is out-of-band connectivity to one of the APICs controlling
-the fabric.
+# EXECUTION OPTIONS
 
-In order to package the tool with dependencies just run from the
-current directory the command:
+## Option 1: Run from the APIC CLI
 
-```./zipTool```
+On your machine (copy the zip file to your APIC):
+1. ```git clone git@github.com:datacenter/ACI-ESG-Migration-Assistant.git```
+2. ```cd ACI-ESG-Migration-Assistant```
+3. ```scp ESGMigrationAssistant-<version>.zip admin@<your-APIC-IP>:/data/techsupport```
 
-the expected outcome is to generate a zip file under directory:
-
-```./dist/ESGMigrationAssistant-<version>.zip```
-
-This zip file it's supposed to be copied in the directory
-/data/techsupport of an APIC (if the preferred method of running
-directly from APIC is used). 
-
-# EXECUTION
-The user once on APIC can then follow these steps:
-
+Then, on your APIC:
 1. ```cd /data/techsupport```
 2. ```unzip ESGMigrationAssistant-<version>.zip```
 3. ```cd ESGMigrationAssistant-<version>```
 4. ```./ESGMigrationAssistant <parameters>```
+
+> [!TIP]
+> On APIC version 6.2(2)+, you do not need to follow these procedures unless the pre-packaged one is outdated because ESG Migration Assistant is pre-packaged under `/data/esgmigration/`.
+
+## Option 2: Run from your machine
+
+1. ```git clone git@github.com:datacenter/ACI-ESG-Migration-Assistant.git```
+2. ```cd ACI-ESG-Migration-Assistant```
+3. ```./zipTool```
+4. ```cd build/ESGMigrationAssistant-<version>```
+5. ```./ESGMigrationAssistant <parameters>```
+
+> [!NOTE]
+> Python 3.12+ is required.
+> 
+> `zipTool` installs the python dependencies into
+> `./build/ESGMigrationAssistant-<version>/deps` based on the `requirements.txt`.
+>
+> It also packages them along with `./src` into `./dist/ESGMigrationAssistant-<version>.zip`
+> which may or may not be the same as the pre-packaged zip file in this repository (`./ESGMigrationAssistant-<version>.zip`).
+> The libraries used for the dependencies could vary depedning on your machine and its python version.
+> The pre-packaged zip file in this repository (`./ESGMigrationAssistant-<version>.zip`) was packaged with python 3.12
+> to be copied and ran directly on the APIC CLI.
 
 # ESGMigrationAssistant
 
